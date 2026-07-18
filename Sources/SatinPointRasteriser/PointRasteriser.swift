@@ -61,8 +61,38 @@ public final class PointRasteriser: Object, @unchecked Sendable {
     private var resolveDepthTexture: MTLTexture?
     private var resolveDepthTextureB: MTLTexture?
 
+    /// The drawable (composite target) viewport, in pixels. Internal
+    /// rasterisation buffers are sized to this × ``renderScale`` (see
+    /// ``scaledPixelSize``); the composite resolves back down to this.
     private var viewport: SIMD4<Float> = .zero
     private var scaleFactor: Float = 1.0
+
+    /// Supersampling factor for the internal point-rasterisation passes. The
+    /// depth/color/resolve/hole-fill passes render at `viewport × renderScale`
+    /// and the composite linearly resolves back down to the drawable — trading
+    /// fill cost (≈`renderScale²` pixels + memory) for anti-aliased point
+    /// edges. `1` (the default) renders at drawable resolution with no
+    /// supersampling and is a no-op for every existing consumer. The
+    /// composite's single bilinear tap resolves a 2× footprint exactly, so `2`
+    /// is the quality sweet spot; higher factors keep costing `renderScale²`
+    /// with diminishing resolve quality. Clamped to `≥ 1`.
+    public var renderScale: Float = 1.0 {
+        didSet {
+            let clamped = max(1.0, renderScale)
+            if clamped != renderScale { renderScale = clamped; return } // re-enters didSet, then falls through
+            guard renderScale != oldValue else { return }
+            resizeResources()
+        }
+    }
+
+    /// Internal (supersampled) pixel dimensions = drawable viewport ×
+    /// ``renderScale``, rounded. Both the resource buffers and the per-frame
+    /// `screenSize` derive from this single source so they always agree.
+    private var scaledPixelSize: (width: Int, height: Int) {
+        let s = max(1.0, renderScale)
+        return (max(0, Int((viewport.z * s).rounded())),
+                max(0, Int((viewport.w * s).rounded())))
+    }
 
     // Per-viewport resource cache (LRU cap 4), keyed by integer pixel size, so
     // alternating render sizes (e.g. live drawable vs. offline target) don't
@@ -228,7 +258,20 @@ public final class PointRasteriser: Object, @unchecked Sendable {
         }
 
         let viewProjection = camera.projectionMatrix * camera.viewMatrix
-        let screenSize = SIMD2<UInt32>(UInt32(max(viewport.z, 0)), UInt32(max(viewport.w, 0)))
+        // Rasterisation runs at the supersampled internal resolution.
+        let (scaledWidth, scaledHeight) = scaledPixelSize
+        let screenSize = SIMD2<UInt32>(UInt32(scaledWidth), UInt32(scaledHeight))
+        // Point footprints are specified in pixels: the min/max clamps are pixel
+        // sizes, so they scale with `renderScale` to hold the on-screen
+        // footprint constant. `pointSizeScale` is pixel-like in screen-space
+        // mode (scale it) but a world-space radius otherwise (leave it — the
+        // already-scaled `screenSize` carries the resolution through).
+        let s = max(1.0, renderScale)
+        let scaledMinPointSize = configuration.minimumPointSize * s
+        let scaledMaxPointSize = configuration.maximumPointSize * s
+        let scaledPointSizeScale = configuration.pointSizeMode == .screenSpace
+            ? configuration.pointSizeScale * s
+            : configuration.pointSizeScale
 
         // Stash the selection-affecting camera state so `encode` can build the
         // full-sweep LODSelect skip key (see ``LODSelectKey``).
@@ -248,17 +291,17 @@ public final class PointRasteriser: Object, @unchecked Sendable {
         depthProcessor.viewMatrix = camera.viewMatrix
         depthProcessor.projectionMatrix = camera.projectionMatrix
         depthProcessor.pointSizeMode = configuration.pointSizeMode
-        depthProcessor.minimumPointSize = configuration.minimumPointSize
-        depthProcessor.maximumPointSize = configuration.maximumPointSize
-        depthProcessor.pointSizeScale = configuration.pointSizeScale
+        depthProcessor.minimumPointSize = scaledMinPointSize
+        depthProcessor.maximumPointSize = scaledMaxPointSize
+        depthProcessor.pointSizeScale = scaledPointSizeScale
 
         colorProcessor.screenSize = screenSize
         colorProcessor.viewMatrix = camera.viewMatrix
         colorProcessor.projectionMatrix = camera.projectionMatrix
         colorProcessor.pointSizeMode = configuration.pointSizeMode
-        colorProcessor.minimumPointSize = configuration.minimumPointSize
-        colorProcessor.maximumPointSize = configuration.maximumPointSize
-        colorProcessor.pointSizeScale = configuration.pointSizeScale
+        colorProcessor.minimumPointSize = scaledMinPointSize
+        colorProcessor.maximumPointSize = scaledMaxPointSize
+        colorProcessor.pointSizeScale = scaledPointSizeScale
         colorProcessor.depthTolerance = configuration.depthTolerance
         colorProcessor.colorizeChunks = configuration.colorizeChunks
         colorProcessor.colorizeOverdraw = configuration.colorizeOverdraw
@@ -292,9 +335,9 @@ public final class PointRasteriser: Object, @unchecked Sendable {
             processor.viewMatrix = camera.viewMatrix
             processor.projectionMatrix = camera.projectionMatrix
             processor.pointSizeMode = configuration.pointSizeMode
-            processor.minimumPointSize = configuration.minimumPointSize
-            processor.maximumPointSize = configuration.maximumPointSize
-            processor.pointSizeScale = configuration.pointSizeScale
+            processor.minimumPointSize = scaledMinPointSize
+            processor.maximumPointSize = scaledMaxPointSize
+            processor.pointSizeScale = scaledPointSizeScale
         }
         nearestResolveProcessor.invProjectionMatrix = invProjection
         nearestResolveProcessor.enablePointRejection = configuration.enablePointRejection
@@ -536,7 +579,7 @@ public final class PointRasteriser: Object, @unchecked Sendable {
 
     private func encodeHighQualityAverage(_ commandBuffer: MTLCommandBuffer, pixelBuffer: MTLBuffer, clouds: [PointRasteriserPointCloud]) {
         clearProcessor.pixelBuffer = pixelBuffer
-        clearProcessor.pixelCount = Int(viewport.z) * Int(viewport.w)
+        clearProcessor.pixelCount = scaledPixelSize.width * scaledPixelSize.height
         clearProcessor.update(commandBuffer)
 
         if let encoder = commandBuffer.makeComputeCommandEncoder(dispatchType: .concurrent) {
@@ -596,7 +639,7 @@ public final class PointRasteriser: Object, @unchecked Sendable {
               let args = cloud.frontLodDispatchArgsBuffer
         else { return false }
 
-        let pixelCount = Int(viewport.z) * Int(viewport.w)
+        let pixelCount = scaledPixelSize.width * scaledPixelSize.height
 
         if capabilities.use64BitAtomics, let winner = nearestWinnerBuffer {
             if let blit = commandBuffer.makeBlitCommandEncoder() {
@@ -667,8 +710,11 @@ public final class PointRasteriser: Object, @unchecked Sendable {
     ///     (point clouds are sparse; the exact pixel is often empty).
     /// - Returns: the pack-order source index under `ndc`, or `nil` if off-cloud.
     public func pickPointIndex(atNDC ndc: SIMD2<Float>, in cloud: PointRasteriserPointCloud, camera: Camera, searchRadius: Int = 10) -> UInt32? {
-        let width = Int(viewport.z), height = Int(viewport.w)
+        // The nearest-index buffer is at the supersampled resolution, so map and
+        // index in that space (NDC is resolution-independent).
+        let (width, height) = scaledPixelSize
         guard width > 0, height > 0, nearestIndexBuffer != nil, cloud.frontLodPositionsBuffer != nil else { return nil }
+        let s = max(1.0, renderScale)
 
         // NDC (y-up) → buffer pixel (the winner pass flips Y).
         let px = min(max(Int((ndc.x * 0.5 + 0.5) * Float(width)), 0), width - 1)
@@ -682,14 +728,18 @@ public final class PointRasteriser: Object, @unchecked Sendable {
             processor.viewMatrix = camera.viewMatrix
             processor.projectionMatrix = camera.projectionMatrix
             processor.pointSizeMode = configuration.pointSizeMode
-            processor.minimumPointSize = configuration.minimumPointSize
-            processor.maximumPointSize = configuration.maximumPointSize
-            processor.pointSizeScale = configuration.pointSizeScale
+            processor.minimumPointSize = configuration.minimumPointSize * s
+            processor.maximumPointSize = configuration.maximumPointSize * s
+            processor.pointSizeScale = configuration.pointSizeMode == .screenSpace
+                ? configuration.pointSizeScale * s
+                : configuration.pointSizeScale
         }
         cloud.updateFiles(viewProjection: camera.projectionMatrix * camera.viewMatrix, modelMatrix: cloud.worldMatrix)
 
         let stride = MemoryLayout<UInt32>.stride
-        let r = max(0, searchRadius)
+        // Search radius is a screen-pixel budget; widen it into the supersampled
+        // buffer so the picked region matches on-screen regardless of renderScale.
+        let r = Int((Float(max(0, searchRadius)) * s).rounded())
         let rowStart = max(0, py - r), rowEnd = min(height - 1, py + r)
         let rowCount = rowEnd - rowStart + 1
         let bandLength = rowCount * width * stride
@@ -739,8 +789,8 @@ public final class PointRasteriser: Object, @unchecked Sendable {
             return (resolveColorTexture, resolveDepthTexture)
         }
 
-        holeFillProcessor.width = Int(viewport.z)
-        holeFillProcessor.height = Int(viewport.w)
+        holeFillProcessor.width = scaledPixelSize.width
+        holeFillProcessor.height = scaledPixelSize.height
 
         var srcColor = colorA, dstColor = colorB
         var srcDepth = depthA, dstDepth = depthB
@@ -901,8 +951,8 @@ public final class PointRasteriser: Object, @unchecked Sendable {
     }
 
     private func resizeResources() {
-        let width = Int(viewport.z)
-        let height = Int(viewport.w)
+        // Internal buffers render at the supersampled resolution…
+        let (width, height) = scaledPixelSize
         let pixelCount = width * height
         guard width > 0, height > 0, pixelCount > 0 else { return }
 
@@ -934,8 +984,11 @@ public final class PointRasteriser: Object, @unchecked Sendable {
         nearestResolveProcessor.backgroundColor = configuration.backgroundColor
         holeFillProcessor.width = width
         holeFillProcessor.height = height
-        postProcessor.resize(size: (Float(width), Float(height)), scaleFactor: scaleFactor)
-        postDepthProcessor.resize(size: (Float(width), Float(height)), scaleFactor: scaleFactor)
+        // …but the composite resolves back down to the drawable viewport (it
+        // samples the supersampled `outputTexture` with normalized coords, so
+        // the larger source is bilinearly downsampled = supersampling).
+        postProcessor.resize(size: (viewport.z, viewport.w), scaleFactor: scaleFactor)
+        postDepthProcessor.resize(size: (viewport.z, viewport.w), scaleFactor: scaleFactor)
     }
 
     private func allocateAndCache(width: Int, height: Int, key: SIMD2<Int32>) -> CachedResources {
