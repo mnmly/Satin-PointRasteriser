@@ -66,6 +66,7 @@ private struct PointRasteriserContentView: View {
                                 isPLYImporterPresented = true
                             } label: {
                                 Label("Open PLY…", systemImage: "doc")
+                                    .help("Select one or more PLY files")
                             }
                             #if canImport(SwiftPDAL)
                             Button {
@@ -100,12 +101,12 @@ private struct PointRasteriserContentView: View {
         .fileImporter(
             isPresented: $isPLYImporterPresented,
             allowedContentTypes: [.ply],
-            allowsMultipleSelection: false
+            allowsMultipleSelection: true
         ) { result in
             switch result {
             case let .success(urls):
-                if let url = urls.first {
-                    renderer.loadPLY(url: url)
+                if !urls.isEmpty {
+                    renderer.loadPLYs(urls: urls)
                 }
             case let .failure(error):
                 renderer.appState.errorMessage = error.localizedDescription

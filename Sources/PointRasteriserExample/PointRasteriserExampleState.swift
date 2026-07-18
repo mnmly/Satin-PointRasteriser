@@ -121,6 +121,13 @@ final class PointRasteriserExampleState {
     // MARK: - Sine-wave displacement demo ('D' key / toggle)
 
     var sineDisplacementEnabled: Bool = false
+    /// Wave amplitude as a **fraction of the loaded cloud's radius**, so the same
+    /// slider is visible on a unit-cube fixture and a 100 m COPC scene alike. The
+    /// renderer multiplies this by the cloud radius before binding it to the kernel.
+    var sineDisplacementAmplitude: Float = 0.08
+    /// Wave frequency in **cycles across the cloud's radius** (also scale-normalized
+    /// by the renderer), so the sine stays coherent regardless of world extent.
+    var sineDisplacementFrequency: Float = 7.0
 
     // MARK: - Depth of field (DisplacementPass jitter + TintPass coverage recipe)
 

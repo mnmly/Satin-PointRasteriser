@@ -38,6 +38,11 @@ final class PointRasteriserExampleRenderer: ViewRenderer, @unchecked Sendable {
     /// Settings-UI state; mirrored into `rasteriser.configuration` every frame.
     let appState = PointRasteriserExampleState()
 
+    /// Every cloud from the most recent PLY import (one per selected file).
+    /// `pointCloud` is the first of these (the telemetry / DoF "front" cloud);
+    /// the rest are extra clouds the rasteriser merges each frame.
+    private var plyClouds: [PointRasteriserPointCloud] = []
+
     #if canImport(SwiftPDAL)
     // One StreamingAdapter / cloud per open COPC file. PointRasteriser
     // traverses and merges all added clouds per frame, so concurrent streams
@@ -58,22 +63,27 @@ final class PointRasteriserExampleRenderer: ViewRenderer, @unchecked Sendable {
 
     // 'D' toggles a live-compiled sine-wave displacement sketch (proves the
     // DisplacementPass end-to-end, independent of the DoF recipe below). Both
-    // share `pointCloud.displacementBuffer` — don't enable both at once.
+    // write each cloud's displacementBuffer — don't enable both at once.
     private var displacementPass: DisplacementPass?
     private var displaceTime: Float = 0
     private let startDate = Date()
 
     /// Demo sketch: warps points vertically by a travelling sine of world-X.
+    /// `amplitude` and `frequency` are bound per frame (USER1/USER2) so the
+    /// settings sliders can amplify the wave — essential for large COPC scenes
+    /// where the old hard-coded 0.08 unit / ×8 values were invisible.
     private static let displacementKernel = """
     kernel void computeDisplacement(
         uint id [[thread_position_in_grid]],
         SCR_DISPLACEMENT_KERNEL_BUFFERS,
-        constant float &time [[buffer(SCR_DISP_BUF_USER0)]]
+        constant float &time [[buffer(SCR_DISP_BUF_USER0)]],
+        constant float &amplitude [[buffer(SCR_DISP_BUF_USER1)]],
+        constant float &frequency [[buffer(SCR_DISP_BUF_USER2)]]
     ) {
         RasterBatch batch; uint pointIndex; uint localOffset;
         if (!scr_resolveDisplacementThread(id, _scrInfo, batches, batch, pointIndex, localOffset)) return;
         const float3 p = scr_decodePointAt(pointIndex, batch, xyzLow, xyzMed, xyzHigh, levels);
-        const float wave = sin(p.x * 8.0 + time * 3.0) * 0.08;
+        const float wave = sin(p.x * frequency + time * 3.0) * amplitude;
         displacements[pointIndex] = float3(0.0, wave, 0.0);
     }
     """
@@ -84,8 +94,19 @@ final class PointRasteriserExampleRenderer: ViewRenderer, @unchecked Sendable {
 
     private var dofDisplacementPass: DisplacementPass?
     private var dofTintPass: TintPass?
+    // Previously-applied DoF toggle states, so `encodeDof` disables a pass only
+    // on the enabled→disabled transition. Calling `disable()` every frame stomps
+    // the rasteriser-global `configuration.applyDisplacement` flag that other
+    // passes (e.g. the 'D'-key sine demo) enable during the same draw.
+    private var dofWasEnabled = false
+    private var dofJitterWasEnabled = false
+    private var dofTranslucentWasEnabled = false
     /// World-space centre of the loaded cloud, for `dofAutoFocus`.
     private var cloudCenter: SIMD3<Float> = .zero
+    /// World-space radius (half bounding diagonal) of the loaded cloud, used to
+    /// scale the sine-displacement amplitude/frequency so the demo is visible on
+    /// clouds of any extent. Defaults to the fixture's ~unit-cube radius.
+    private var cloudRadius: Float = 0.87
 
     // Byte-compatible with the embedded .metal `CameraUniforms` / `DofParams`.
     private struct DofCameraUniforms {
@@ -135,7 +156,15 @@ final class PointRasteriserExampleRenderer: ViewRenderer, @unchecked Sendable {
         displacementPass?.bindUserBuffers = { [weak self] encoder in
             guard let self else { return }
             var t = self.displaceTime
+            // Amplitude/frequency are authored in cloud-radius-relative units and
+            // scaled to world here, so one slider setting reads the same on the
+            // unit-cube fixture and a 100 m COPC scene.
+            let radius = max(self.cloudRadius, 1e-4)
+            var amplitude = self.appState.sineDisplacementAmplitude * radius
+            var frequency = self.appState.sineDisplacementFrequency / radius
             encoder.setBytes(&t, length: MemoryLayout<Float>.stride, index: DisplacementPass.bufferUser0)
+            encoder.setBytes(&amplitude, length: MemoryLayout<Float>.stride, index: DisplacementPass.bufferUser1)
+            encoder.setBytes(&frequency, length: MemoryLayout<Float>.stride, index: DisplacementPass.bufferUser2)
         }
 
         makeDofPasses()
@@ -177,7 +206,9 @@ final class PointRasteriserExampleRenderer: ViewRenderer, @unchecked Sendable {
         // displacement/tint.
         if appState.sineDisplacementEnabled {
             displaceTime = Float(Date().timeIntervalSince(startDate))
-            displacementPass?.encode(commandBuffer: commandBuffer, cloud: pointCloud)
+            // cloud: nil → displace every loaded cloud (all imported PLYs), each
+            // into its own displacementBuffer.
+            displacementPass?.encode(commandBuffer: commandBuffer, cloud: nil)
         }
         encodeDof(commandBuffer: commandBuffer)
 
@@ -229,40 +260,65 @@ final class PointRasteriserExampleRenderer: ViewRenderer, @unchecked Sendable {
 
     // MARK: - PLY loading
 
-    /// Parses `url` off the main thread, then installs the result as the
-    /// rendered cloud (replacing whatever is currently loaded) and reframes
-    /// the camera. Errors are surfaced through ``PointRasteriserExampleState/errorMessage``.
+    /// Convenience single-file entry point — loads `url` as a one-element set.
     func loadPLY(url: URL) {
+        loadPLYs(urls: [url])
+    }
+
+    /// Parses one or more PLY files off the main thread, then installs them as
+    /// **separate** clouds (all added to the rasteriser, which merges them each
+    /// frame), replacing whatever set is currently loaded, and reframes the
+    /// camera to the combined bounds. Per-file parse errors are surfaced through
+    /// ``PointRasteriserExampleState/errorMessage`` and the file is skipped, so a
+    /// selection with one bad file still loads the rest.
+    func loadPLYs(urls: [URL]) {
+        guard !urls.isEmpty else { return }
         appState.isLoading = true
         appState.errorMessage = nil
         Task.detached { [weak self] in
             guard let self else { return }
-            let shouldStop = url.startAccessingSecurityScopedResource()
-            defer { if shouldStop { url.stopAccessingSecurityScopedResource() } }
-            do {
-                // Parse to contiguous arrays off the main thread; pack on the GPU
-                // (the fast path) on the main thread so the whole load — even for
-                // 40M+ point clouds — takes a fraction of the old CPU pack.
-                let parseStart = Date()
-                let (positions, colors) = try PLYPointCloudLoader.loadArrays(url: url)
-                let parseSeconds = Date().timeIntervalSince(parseStart)
-                await MainActor.run {
-                    self.installGPUPackedCloud(positions: positions, colors: colors, name: url.lastPathComponent, parseSeconds: parseSeconds)
-                }
-            } catch {
-                await MainActor.run {
-                    self.appState.isLoading = false
-                    self.appState.errorMessage = error.localizedDescription
+            // Parse every file to contiguous arrays off the main thread; the GPU
+            // pack (the fast path) then runs on the main thread so even 40M+
+            // point clouds load in a fraction of the old CPU pack.
+            var parsed: [ParsedPLY] = []
+            var parseSeconds = 0.0
+            for url in urls {
+                let shouldStop = url.startAccessingSecurityScopedResource()
+                defer { if shouldStop { url.stopAccessingSecurityScopedResource() } }
+                do {
+                    let parseStart = Date()
+                    let (positions, colors) = try PLYPointCloudLoader.loadArrays(url: url)
+                    parseSeconds += Date().timeIntervalSince(parseStart)
+                    parsed.append(ParsedPLY(name: url.lastPathComponent, positions: positions, colors: colors))
+                } catch {
+                    await MainActor.run {
+                        self.appState.errorMessage = "PLY load failed (\(url.lastPathComponent)): \(error.localizedDescription)"
+                    }
                 }
             }
+            let totalParseSeconds = parseSeconds
+            await MainActor.run {
+                self.installGPUPackedClouds(parsed, parseSeconds: totalParseSeconds)
+            }
         }
+    }
+
+    /// One parsed PLY file, ready to GPU-pack on the main thread.
+    private struct ParsedPLY {
+        let name: String
+        let positions: [SIMD3<Float>]
+        let colors: [SIMD4<Float>]
     }
 
     /// Cached GPU packer (compiles the pack kernels once). Nil until first use.
     private var gpuPacker: GPUPacker?
 
     @MainActor
-    private func installGPUPackedCloud(positions: [SIMD3<Float>], colors: [SIMD4<Float>], name: String, parseSeconds: TimeInterval) {
+    private func installGPUPackedClouds(_ parsed: [ParsedPLY], parseSeconds: TimeInterval) {
+        guard !parsed.isEmpty else {
+            appState.isLoading = false
+            return
+        }
         do {
             let packer: GPUPacker
             if let existing = gpuPacker {
@@ -271,25 +327,64 @@ final class PointRasteriserExampleRenderer: ViewRenderer, @unchecked Sendable {
                 packer = try GPUPacker(device: defaultContext.device)
                 gpuPacker = packer
             }
+
+            // Drop the current set (fixture / prior PLYs / any streams) before
+            // appending the new clouds, so `pointCloud` is never a stale child.
+            teardownLoadedClouds()
+            #if canImport(SwiftPDAL)
+            appState.isStreaming = false
+            #endif
+
             let packStart = Date()
-            let newCloud = PointRasteriserPointCloud.gpuPacked(
-                context: defaultContext, packer: packer, queue: defaultContext.commandQueue,
-                positions: positions, colors: colors, label: name
-            )
+            var newClouds: [PointRasteriserPointCloud] = []
+            var totalPoints = 0
+            var combinedMin = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+            var combinedMax = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+            for item in parsed {
+                let cloud = PointRasteriserPointCloud.gpuPacked(
+                    context: defaultContext, packer: packer, queue: defaultContext.commandQueue,
+                    positions: item.positions, colors: item.colors, label: item.name
+                )
+                rasteriser.addPointCloud(cloud)
+                newClouds.append(cloud)
+                totalPoints += cloud.pointCount
+                combinedMin = simd_min(combinedMin, cloud.sourceBoundsMin)
+                combinedMax = simd_max(combinedMax, cloud.sourceBoundsMax)
+            }
             let packSeconds = Date().timeIntervalSince(packStart)
-            rasteriser.removePointCloud(pointCloud)
-            rasteriser.addPointCloud(newCloud)
-            pointCloud = newCloud
-            frameCamera(toBoundsMin: newCloud.sourceBoundsMin, boundsMax: newCloud.sourceBoundsMax)
+
+            plyClouds = newClouds
+            pointCloud = newClouds[0]
+            frameCamera(toBoundsMin: combinedMin, boundsMax: combinedMax)
             rasteriser.restartLODSweep()
             appState.isLoading = false
-            appState.status = "\(name) (\(newCloud.pointCount) pts) — parse \(String(format: "%.2f", parseSeconds))s, GPU pack \(String(format: "%.3f", packSeconds))s"
+            let label = parsed.count == 1 ? parsed[0].name : "\(parsed[0].name) +\(parsed.count - 1)"
+            let fileWord = parsed.count == 1 ? "file" : "files"
+            appState.status = "\(label) (\(totalPoints) pts across \(parsed.count) \(fileWord)) — parse \(String(format: "%.2f", parseSeconds))s, GPU pack \(String(format: "%.3f", packSeconds))s"
             appState.errorMessage = nil
-            print("[loadPLY] \(name): \(newCloud.pointCount) pts, parse \(String(format: "%.2f", parseSeconds))s, GPU pack \(String(format: "%.3f", packSeconds))s")
+            print("[loadPLYs] \(label): \(totalPoints) pts, \(parsed.count) \(fileWord), parse \(String(format: "%.2f", parseSeconds))s, GPU pack \(String(format: "%.3f", packSeconds))s")
         } catch {
             appState.isLoading = false
             appState.errorMessage = error.localizedDescription
         }
+    }
+
+    /// Remove every currently-loaded cloud from the rasteriser — the fixture /
+    /// PLY set and (when the streaming module is present) all COPC streams — so a
+    /// fresh import can append cleanly. `removePointCloud` is a no-op for a cloud
+    /// that isn't a child, so the belt-and-suspenders `pointCloud` removal is
+    /// safe even when it's already one of `plyClouds`.
+    @MainActor
+    private func teardownLoadedClouds() {
+        #if canImport(SwiftPDAL)
+        for adapter in streamingAdapters { adapter.close() }
+        streamingAdapters.removeAll()
+        for cloud in streamingClouds { rasteriser.removePointCloud(cloud) }
+        streamingClouds.removeAll()
+        #endif
+        for cloud in plyClouds { rasteriser.removePointCloud(cloud) }
+        plyClouds.removeAll()
+        rasteriser.removePointCloud(pointCloud)
     }
 
     private func frameCamera(toBoundsMin boundsMin: SIMD3<Float>, boundsMax: SIMD3<Float>) {
@@ -301,6 +396,7 @@ final class PointRasteriserExampleRenderer: ViewRenderer, @unchecked Sendable {
 
         // DoF: focus on the cloud centre by default; size the manual slider to fit.
         cloudCenter = center
+        cloudRadius = radius
         let camDistance = simd_length(position - center)
         appState.dofFocus = camDistance
         appState.dofFocusMax = max(camDistance * 3, radius * 6)
@@ -389,7 +485,7 @@ extension PointRasteriserExampleRenderer {
                 let totalBytes = max(64, self.appState.streamingBudgetMB) * 1024 * 1024
                 let perSourceBytes = max(1, totalBytes / urls.count)
                 self.lastCOPCURLs = urls
-                self.teardownStreamingSet()
+                self.teardownLoadedClouds()
                 self.appState.status = urls.count == 1
                     ? urls[0].lastPathComponent
                     : "\(urls[0].lastPathComponent) +\(urls.count - 1)"
@@ -466,19 +562,6 @@ extension PointRasteriserExampleRenderer {
         if !lastCOPCURLs.isEmpty {
             loadCOPC(urls: lastCOPCURLs)
         }
-    }
-
-    /// Close every adapter, remove every streaming cloud (and the PLY/fixture
-    /// cloud on the first stream) from the rasteriser, and reset the arrays.
-    /// `removePointCloud` is a no-op for a cloud that isn't a child, so the
-    /// belt-and-suspenders fixture removal is safe on repeat calls.
-    @MainActor
-    private func teardownStreamingSet() {
-        for adapter in streamingAdapters { adapter.close() }
-        streamingAdapters.removeAll()
-        for cloud in streamingClouds { rasteriser.removePointCloud(cloud) }
-        streamingClouds.removeAll()
-        rasteriser.removePointCloud(pointCloud)
     }
 
     @MainActor
@@ -563,18 +646,33 @@ extension PointRasteriserExampleRenderer {
     /// toggle is off.
     func encodeDof(commandBuffer: MTLCommandBuffer) {
         guard appState.dofEnabled else {
-            dofDisplacementPass?.disable(); dofTintPass?.disable(); return
+            // Only disable on the enabled→disabled transition; disabling every
+            // frame would stomp the rasteriser-global `applyDisplacement` flag
+            // that other passes (the sine demo) enable during the same draw.
+            if dofWasEnabled {
+                dofDisplacementPass?.disable(); dofTintPass?.disable()
+            }
+            dofWasEnabled = false
+            dofJitterWasEnabled = false
+            dofTranslucentWasEnabled = false
+            return
         }
+        dofWasEnabled = true
+        // cloud: nil → apply DoF to every loaded cloud. `bindDof` binds the front
+        // cloud's world/focus for all of them; imported PLYs share an identity
+        // world matrix, so that's exact here.
         if appState.dofJitter {
-            dofDisplacementPass?.encode(commandBuffer: commandBuffer, cloud: pointCloud)
-        } else {
+            dofDisplacementPass?.encode(commandBuffer: commandBuffer, cloud: nil)
+        } else if dofJitterWasEnabled {
             dofDisplacementPass?.disable()
         }
+        dofJitterWasEnabled = appState.dofJitter
         if appState.dofTranslucent {
-            dofTintPass?.encode(commandBuffer: commandBuffer, cloud: pointCloud)
-        } else {
+            dofTintPass?.encode(commandBuffer: commandBuffer, cloud: nil)
+        } else if dofTranslucentWasEnabled {
             dofTintPass?.disable()
         }
+        dofTranslucentWasEnabled = appState.dofTranslucent
     }
 
     /// Bind USER0 = per-cloud camera (modelView + focal distance), USER1 = the

@@ -115,6 +115,12 @@ struct PointRasteriserSettingsView: View {
 
                 Section("Sine-wave displacement demo") {
                     Toggle("Enable ('D' key)", isOn: $appState.sineDisplacementEnabled)
+                    sliderRow(title: "Amplitude (× cloud radius)", value: floatBinding(\.sineDisplacementAmplitude), range: 0 ... 0.5,
+                              formatter: { String(format: "%.3f", $0) })
+                        .disabled(!appState.sineDisplacementEnabled)
+                    sliderRow(title: "Frequency (cycles / radius)", value: floatBinding(\.sineDisplacementFrequency), range: 0 ... 30,
+                              formatter: { String(format: "%.1f", $0) })
+                        .disabled(!appState.sineDisplacementEnabled)
                 }
 
                 #if canImport(SwiftPDAL)
