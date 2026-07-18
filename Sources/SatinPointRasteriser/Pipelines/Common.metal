@@ -52,8 +52,6 @@ inline int pointFootprintRadius(
 ) {
     const float3 worldPoint = (file.world * float4(point, 1.0)).xyz;
     const float4 viewPos = viewMatrix * float4(worldPoint, 1.0);
-    const float lo = max(min(minimumPointSize, maximumPointSize), 1.0);
-    const float hi = max(max(minimumPointSize, maximumPointSize), lo);
 
     // Orthographic apparent size must not vary with depth. projectionMatrix[3][3]
     // (column 3, row 3 — Metal's float4x4 is column-major) is 1.0 for an
@@ -62,6 +60,11 @@ inline int pointFootprintRadius(
 
     float pointSize;
     if (pointSizeMode == 1) {
+        // World space: pointSizeScale is a metric radius projected to pixels, so
+        // the on-screen size varies with depth — clamp it to the Min…Max pixel
+        // band (Min floored to 1px) to bound near/far extremes.
+        const float lo = max(min(minimumPointSize, maximumPointSize), 1.0);
+        const float hi = max(max(minimumPointSize, maximumPointSize), lo);
         const float focal = float(screenSize.y) * 0.5 * projectionMatrix[1][1];
         if (ortho) {
             pointSize = 2.0 * pointSizeScale * focal;
@@ -69,17 +72,16 @@ inline int pointFootprintRadius(
             const float viewZ = max(-viewPos.z, 0.000001);
             pointSize = 2.0 * pointSizeScale * focal / viewZ;
         }
+        if (!isfinite(pointSize)) { pointSize = lo; }
+        pointSize = clamp(pointSize, lo, hi);
     } else {
-        // Screen space: a fixed on-screen size, in pixels, independent of depth
-        // (pointSizeScale is the px diameter before the Min…Max clamp). No
-        // distance falloff in either projection — world-space mode is the
-        // physically-attenuated path.
+        // Screen space: pointSizeScale IS the on-screen px diameter, uniform for
+        // every point regardless of depth. Min/Max do not apply here — there is
+        // no depth-varying size to bound, and clamping would let a stale
+        // Min==Max override Scale entirely. The radius encoding below already
+        // floors at 1px and caps the footprint at ~33px.
         pointSize = pointSizeScale;
     }
-    if (!isfinite(pointSize)) {
-        pointSize = lo;
-    }
-    pointSize = clamp(pointSize, lo, hi);
     return clamp(int(ceil(max(pointSize - 1.0, 0.0) * 0.5)), 0, 16);
 }
 
