@@ -668,6 +668,66 @@ private func writeKernel(_ source: String, _ name: String) -> URL {
     #expect(r.coveredPixelCount == 0, "NaN displacement should cull every point, got \(r.coveredPixelCount)")
 }
 
+/// Regression: `encode(cloud: nil)` must dispatch for EVERY cloud on the
+/// rasteriser (not just the first), and two clouds sharing one command buffer
+/// must not race on a shared info buffer. Both bugs leave points undisplaced:
+/// the first-cloud-only default zeroes the second cloud entirely, and the shared
+/// info memcpy makes the larger cloud's dispatch read the smaller cloud's counts
+/// (`totalPoints`/`batchCount`), leaving its tail points unwritten. The two
+/// clouds have DIFFERENT point counts so the info race is detectable.
+@Test func displacementNilCloudTargetsAllCloudsWithoutInfoRace() {
+    guard let device = MTLCreateSystemDefaultDevice() else { return }
+    gpuTestLock.lock(); defer { gpuTestLock.unlock() }
+
+    let context = Context(device: device, sampleCount: 1, colorPixelFormat: .rgba8Unorm, depthPixelFormat: .depth32Float)
+    let rasteriser = PointRasteriser(context: context)
+    rasteriser.setup()
+
+    // cloudA (4096 pts) is larger than cloudB (1000 pts): a wrong shared
+    // totalPoints (B's) would leave cloudA's tail [1000, 4096) unwritten.
+    let cloudA = PointRasteriserPointCloud(context: context, packed: PackedPointCloudFixtures.cubeGrid(pointsPerAxis: 16))
+    let cloudB = PointRasteriserPointCloud(context: context, packed: PackedPointCloudFixtures.cubeGrid(pointsPerAxis: 10))
+    rasteriser.addPointCloud(cloudA)
+    rasteriser.addPointCloud(cloudB)
+    #expect(cloudA.totalPoints != cloudB.totalPoints, "clouds must differ in size to expose the info race")
+
+    // Pre-allocate SHARED displacement buffers (so we can read them CPU-side) and
+    // zero them, so any un-dispatched point stays detectably zero. The pass reuses
+    // a non-nil buffer instead of allocating its own private one.
+    for c in [cloudA, cloudB] {
+        guard let buf = c.makeDisplacementBuffer(storage: .shared, label: "test.disp") else { Issue.record("buffer alloc failed"); return }
+        memset(buf.contents(), 0, buf.length)
+        c.displacementBuffer = buf
+    }
+
+    // Trivial kernel: write a constant (0,1,0) to every resolved point.
+    let url = writeKernel("""
+    kernel void computeDisplacement(uint id [[thread_position_in_grid]], SCR_DISPLACEMENT_KERNEL_BUFFERS) {
+        RasterBatch batch; uint pointIndex; uint localOffset;
+        if (!scr_resolveDisplacementThread(id, _scrInfo, batches, batch, pointIndex, localOffset)) return;
+        displacements[pointIndex] = float3(0.0, 1.0, 0.0);
+    }
+    """, "disp-all")
+    let pass = DisplacementPass(rasteriser: rasteriser, kernelURL: url, live: false)
+
+    guard let cb = context.commandQueue.makeCommandBuffer() else { Issue.record("no command buffer"); return }
+    pass.encode(commandBuffer: cb, cloud: nil) // nil → ALL clouds, one command buffer
+    cb.commit()
+    cb.waitUntilCompleted()
+
+    // Every point of BOTH clouds must have its .y written to 1 (nonzero).
+    for (name, c) in [("A", cloudA), ("B", cloudB)] {
+        let base = c.displacementBuffer!.contents()
+        var written = 0
+        for i in 0 ..< c.totalPoints {
+            let y = base.load(fromByteOffset: i * MemoryLayout<SIMD3<Float>>.stride + MemoryLayout<Float>.stride, as: Float.self)
+            if y != 0 { written += 1 }
+        }
+        #expect(written == c.totalPoints,
+                "cloud \(name): \(written)/\(c.totalPoints) points displaced — nil-cloud must target all clouds without an info race")
+    }
+}
+
 @Test func tintReplaceDiscardAndPassthrough() {
     guard let device = MTLCreateSystemDefaultDevice() else { return }
     gpuTestLock.lock(); defer { gpuTestLock.unlock() }

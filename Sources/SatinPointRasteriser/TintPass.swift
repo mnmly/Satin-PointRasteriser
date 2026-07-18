@@ -3,9 +3,12 @@ import Foundation
 import Metal
 import Satin
 
-/// Drives an on-GPU color-tint compute pass for a ``PointRasteriserPointCloud``.
-/// Mirror of ``DisplacementPass``: owns the pipeline build (with live reload),
-/// auto-allocates the cloud's `tintBuffer`, flips
+/// Drives an on-GPU color-tint compute pass for the
+/// ``PointRasteriserPointCloud``s of a ``PointRasteriser``. A single `encode`
+/// with `cloud: nil` dispatches for **all** of the rasteriser's clouds; pass an
+/// explicit `cloud:` to target one. Mirror of ``DisplacementPass``: owns the
+/// pipeline build (with live reload), auto-allocates each cloud's `tintBuffer`,
+/// flips
 /// ``PointRasteriserConfiguration/applyTint`` `= true` on first encode, and binds
 /// the cloud's batches + xyz + levels + tint + colors buffers each frame.
 ///
@@ -58,7 +61,6 @@ public final class TintPass {
     private let kernelName: String
     private let compiler: MetalFileCompiler
     private var pipeline: MTLComputePipelineState?
-    private var infoBuffer: MTLBuffer?
     private var cancellable: AnyCancellable?
 
     private struct InfoData {
@@ -78,8 +80,6 @@ public final class TintPass {
         self.kernelURL = kernelURL
         self.kernelName = kernelName
         self.compiler = MetalFileCompiler(watch: live)
-        self.infoBuffer = rasteriser.context.device.makeBuffer(length: MemoryLayout<InfoData>.stride, options: .storageModeShared)
-        self.infoBuffer?.label = "TintPass.Info"
         rebuildPipeline()
         if live {
             cancellable = compiler.onUpdatePublisher
@@ -88,19 +88,31 @@ public final class TintPass {
         }
     }
 
-    /// Per-frame entry point. Auto-targets the first cloud; pass `cloud:` for
-    /// multi-cloud setups. Call before `rasteriser.encode(...)`.
+    /// Per-frame entry point. When `cloud` is `nil` this encodes a dispatch for
+    /// **every** cloud on the rasteriser (each gets its own auto-allocated
+    /// `tintBuffer`); pass an explicit `cloud:` to target a single one. Call
+    /// before `rasteriser.encode(...)`.
     public func encode(commandBuffer: MTLCommandBuffer, cloud: PointRasteriserPointCloud? = nil) {
-        guard let rasteriser,
-              let pipeline,
-              let target = cloud ?? rasteriser.pointClouds.first,
-              let batchesBuffer = target.batchesBuffer,
+        guard let rasteriser, let pipeline else { return }
+        if rasteriser.configuration.tintAlphaIsCoverage != alphaIsCoverage {
+            rasteriser.configuration.tintAlphaIsCoverage = alphaIsCoverage
+        }
+        let targets = cloud.map { [$0] } ?? rasteriser.pointClouds
+        for target in targets {
+            encode(for: target, rasteriser: rasteriser, pipeline: pipeline, commandBuffer: commandBuffer)
+        }
+    }
+
+    /// Encode a single cloud's tint dispatch. `InfoData` is bound per-dispatch via
+    /// `setBytes` so two clouds sharing one command buffer can't race on a shared
+    /// info buffer (each dispatch sees its own cloud's counts).
+    private func encode(for target: PointRasteriserPointCloud, rasteriser: PointRasteriser, pipeline: MTLComputePipelineState, commandBuffer: MTLCommandBuffer) {
+        guard let batchesBuffer = target.batchesBuffer,
               let xyzLow = target.xyzLowBuffer,
               let xyzMed = target.xyzMedBuffer,
               let xyzHigh = target.xyzHighBuffer,
               let levels = target.levelsBuffer,
               let colors = target.colorsBuffer,
-              let info = infoBuffer,
               target.totalPoints > 0
         else { return }
 
@@ -112,12 +124,8 @@ public final class TintPass {
         if !rasteriser.configuration.applyTint {
             rasteriser.configuration.applyTint = true
         }
-        if rasteriser.configuration.tintAlphaIsCoverage != alphaIsCoverage {
-            rasteriser.configuration.tintAlphaIsCoverage = alphaIsCoverage
-        }
 
         var infoData = InfoData(pointsPerBatch: UInt32(target.pointsPerBatch), batchCount: UInt32(target.batchCount), totalPoints: UInt32(target.totalPoints))
-        memcpy(info.contents(), &infoData, MemoryLayout<InfoData>.size)
 
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "TintPass"
@@ -128,7 +136,7 @@ public final class TintPass {
         encoder.setBuffer(xyzHigh, offset: 0, index: Self.bufferXYZHigh)
         encoder.setBuffer(levels, offset: 0, index: Self.bufferLevels)
         encoder.setBuffer(out, offset: 0, index: Self.bufferTints)
-        encoder.setBuffer(info, offset: 0, index: Self.bufferInfo)
+        encoder.setBytes(&infoData, length: MemoryLayout<InfoData>.size, index: Self.bufferInfo)
         encoder.setBuffer(colors, offset: 0, index: Self.bufferColors)
         bindUserBuffers?(encoder)
 
@@ -141,6 +149,10 @@ public final class TintPass {
     }
 
     /// Disable the color pass's tint reads without destroying the cloud.
+    ///
+    /// - Note: The `applyTint` flag is **global** to the rasteriser, not per-pass
+    ///   or per-cloud. Calling `disable()` on any `TintPass` turns off tint
+    ///   application for every cloud the rasteriser draws.
     public func disable() {
         rasteriser?.configuration.applyTint = false
     }

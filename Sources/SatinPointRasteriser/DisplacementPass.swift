@@ -3,9 +3,11 @@ import Foundation
 import Metal
 import Satin
 
-/// Drives an on-GPU displacement compute pass for a
-/// ``PointRasteriserPointCloud``. Owns the pipeline build (with live reload),
-/// auto-allocates the cloud's `displacementBuffer`, flips
+/// Drives an on-GPU displacement compute pass for the
+/// ``PointRasteriserPointCloud``s of a ``PointRasteriser``. A single `encode`
+/// with `cloud: nil` dispatches for **all** of the rasteriser's clouds; pass an
+/// explicit `cloud:` to target one. Owns the pipeline build (with live reload),
+/// auto-allocates each cloud's `displacementBuffer`, flips
 /// ``PointRasteriserConfiguration/applyDisplacement`` `= true` on first encode,
 /// and binds the cloud's batches + xyz + levels + displacement + colors buffers
 /// each frame. The sketch only writes the kernel + any extra uniforms.
@@ -67,7 +69,6 @@ public final class DisplacementPass {
     private let kernelName: String
     private let compiler: MetalFileCompiler
     private var pipeline: MTLComputePipelineState?
-    private var infoBuffer: MTLBuffer?
     private var cancellable: AnyCancellable?
 
     private struct InfoData {
@@ -87,8 +88,6 @@ public final class DisplacementPass {
         self.kernelURL = kernelURL
         self.kernelName = kernelName
         self.compiler = MetalFileCompiler(watch: live)
-        self.infoBuffer = rasteriser.context.device.makeBuffer(length: MemoryLayout<InfoData>.stride, options: .storageModeShared)
-        self.infoBuffer?.label = "DisplacementPass.Info"
         rebuildPipeline()
         if live {
             cancellable = compiler.onUpdatePublisher
@@ -97,19 +96,28 @@ public final class DisplacementPass {
         }
     }
 
-    /// Per-frame entry point. Auto-targets the first cloud; pass `cloud:` for
-    /// multi-cloud setups. Call before `rasteriser.encode(...)`/`draw(...)`.
+    /// Per-frame entry point. When `cloud` is `nil` this encodes a dispatch for
+    /// **every** cloud on the rasteriser (each gets its own auto-allocated
+    /// `displacementBuffer`); pass an explicit `cloud:` to target a single one.
+    /// Call before `rasteriser.encode(...)`/`draw(...)`.
     public func encode(commandBuffer: MTLCommandBuffer, cloud: PointRasteriserPointCloud? = nil) {
-        guard let rasteriser,
-              let pipeline,
-              let target = cloud ?? rasteriser.pointClouds.first,
-              let batchesBuffer = target.batchesBuffer,
+        guard let rasteriser, let pipeline else { return }
+        let targets = cloud.map { [$0] } ?? rasteriser.pointClouds
+        for target in targets {
+            encode(for: target, rasteriser: rasteriser, pipeline: pipeline, commandBuffer: commandBuffer)
+        }
+    }
+
+    /// Encode a single cloud's displacement dispatch. `InfoData` is bound
+    /// per-dispatch via `setBytes` so two clouds sharing one command buffer can't
+    /// race on a shared info buffer (each dispatch sees its own cloud's counts).
+    private func encode(for target: PointRasteriserPointCloud, rasteriser: PointRasteriser, pipeline: MTLComputePipelineState, commandBuffer: MTLCommandBuffer) {
+        guard let batchesBuffer = target.batchesBuffer,
               let xyzLow = target.xyzLowBuffer,
               let xyzMed = target.xyzMedBuffer,
               let xyzHigh = target.xyzHighBuffer,
               let levels = target.levelsBuffer,
               let colors = target.colorsBuffer,
-              let info = infoBuffer,
               target.totalPoints > 0
         else { return }
 
@@ -123,7 +131,6 @@ public final class DisplacementPass {
         }
 
         var infoData = InfoData(pointsPerBatch: UInt32(target.pointsPerBatch), batchCount: UInt32(target.batchCount), totalPoints: UInt32(target.totalPoints))
-        memcpy(info.contents(), &infoData, MemoryLayout<InfoData>.size)
 
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "DisplacementPass"
@@ -134,7 +141,7 @@ public final class DisplacementPass {
         encoder.setBuffer(xyzHigh, offset: 0, index: Self.bufferXYZHigh)
         encoder.setBuffer(levels, offset: 0, index: Self.bufferLevels)
         encoder.setBuffer(out, offset: 0, index: Self.bufferDisplacements)
-        encoder.setBuffer(info, offset: 0, index: Self.bufferInfo)
+        encoder.setBytes(&infoData, length: MemoryLayout<InfoData>.size, index: Self.bufferInfo)
         encoder.setBuffer(colors, offset: 0, index: Self.bufferColors)
         bindUserBuffers?(encoder)
 
@@ -147,6 +154,10 @@ public final class DisplacementPass {
     }
 
     /// Disable the rasteriser's displacement reads without destroying the cloud.
+    ///
+    /// - Note: The `applyDisplacement` flag is **global** to the rasteriser, not
+    ///   per-pass or per-cloud. Calling `disable()` on any `DisplacementPass` turns
+    ///   off displacement application for every cloud the rasteriser draws.
     public func disable() {
         rasteriser?.configuration.applyDisplacement = false
     }
