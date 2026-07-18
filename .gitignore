@@ -1,0 +1,23 @@
+.DS_Store
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Xcode
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcscmblueprint
+*.profraw
+
+# Example app local builds
+Examples/**/.build/
+
+# Editor / local environment
+.vscode/
+.idea/
+
+# DocC static-site build output (Scripts/build_docs.sh)
+/docs/
+ref_*.html
