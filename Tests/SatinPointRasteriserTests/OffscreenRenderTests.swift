@@ -728,6 +728,92 @@ private func writeKernel(_ source: String, _ name: String) -> URL {
     }
 }
 
+/// Regression: streaming (slot-pool) clouds must receive DisplacementPass
+/// treatment even when the pool is only PARTIALLY resident. The sketch kernel's
+/// `scr_resolve*Thread` binary-searches the batch table by `firstPoint`; if
+/// never-filled slots carried `firstPoint == 0` the search drifted past the
+/// resident slots (landing on an empty tail slot → state 0 → false), leaving
+/// nearly every resident point undisplaced. Seeding each slot's `firstPoint` to
+/// its fixed pack offset keeps the table sorted so the search lands on the
+/// containing slot; the added `localOffset >= numPoints` guard rejects threads in
+/// a resident slot's unfilled tail. Reverting the seed (fix #1) fails this test.
+@Test func displacementReachesPartiallyResidentSlotPool() {
+    guard let device = MTLCreateSystemDefaultDevice() else { return }
+    gpuTestLock.lock(); defer { gpuTestLock.unlock() }
+
+    let context = Context(device: device, sampleCount: 1, colorPixelFormat: .rgba8Unorm, depthPixelFormat: .depth32Float)
+    let rasteriser = PointRasteriser(context: context)
+    rasteriser.setup()
+
+    // Pack 11³ = 1331 points at 512 pts/batch → 3 source batches (512, 512, 307).
+    // The 3rd batch is PARTIAL, exercising the unfilled-tail guard.
+    let ppb = 512
+    var positions: [SIMD3<Float>] = []
+    var colors: [SIMD4<Float>] = []
+    let n = 11
+    for z in 0 ..< n { for y in 0 ..< n { for x in 0 ..< n {
+        let fx = Float(x) / Float(n - 1), fy = Float(y) / Float(n - 1), fz = Float(z) / Float(n - 1)
+        positions.append(SIMD3<Float>(fx - 0.5, fy - 0.5, fz - 0.5))
+        colors.append(SIMD4<Float>(fx, fy, fz, 1))
+    }}}
+    let packed = PackedPointCloudFixtures.pack(positions: positions, colors: colors, pointsPerBatch: ppb, shuffleBatches: false)
+    #expect(packed.batchCount == 3, "expected 3 source batches, got \(packed.batchCount)")
+
+    // Slot pool with 8 slots; fill only the first 3 (leave 5 never-filled).
+    let slotCapacity = 8
+    let cloud = PointRasteriserPointCloud(context: context, slotCapacity: slotCapacity, pointsPerBatch: ppb, files: packed.files)
+    let slots = cloud.addBatches(
+        positionsXYZLow: dataFrom(packed.xyzLow), positionsXYZMed: dataFrom(packed.xyzMed), positionsXYZHigh: dataFrom(packed.xyzHigh),
+        colors: dataFrom(packed.colors), levels: Data(packed.levels), batches: packed.batches
+    )
+    rasteriser.addPointCloud(cloud)
+    #expect(slots.count == 3 && cloud.residentBatchCount == 3, "expected 3 resident slots")
+    #expect(cloud.totalPoints == slotCapacity * ppb, "pool totalPoints should span every slot")
+
+    // Global point indices that a resident slot actually fills:
+    // union of [slot*ppb, slot*ppb + numPoints) — the rest (unfilled tails +
+    // never-filled slots) must stay zero.
+    var residentWritten = Set<Int>()
+    for (i, slot) in slots.enumerated() {
+        let base = slot * ppb
+        for k in 0 ..< Int(packed.batches[i].numPoints) { residentWritten.insert(base + k) }
+    }
+
+    // Shared, zeroed displacement buffer so un-dispatched points stay detectably 0.
+    guard let buf = cloud.makeDisplacementBuffer(storage: .shared, label: "test.disp.pool") else { Issue.record("buffer alloc failed"); return }
+    memset(buf.contents(), 0, buf.length)
+    cloud.displacementBuffer = buf
+
+    // Trivial kernel: write (0,1,0) to every resolved point.
+    let url = writeKernel("""
+    kernel void computeDisplacement(uint id [[thread_position_in_grid]], SCR_DISPLACEMENT_KERNEL_BUFFERS) {
+        RasterBatch batch; uint pointIndex; uint localOffset;
+        if (!scr_resolveDisplacementThread(id, _scrInfo, batches, batch, pointIndex, localOffset)) return;
+        displacements[pointIndex] = float3(0.0, 1.0, 0.0);
+    }
+    """, "disp-pool")
+    let pass = DisplacementPass(rasteriser: rasteriser, kernelURL: url, live: false)
+
+    guard let cb = context.commandQueue.makeCommandBuffer() else { Issue.record("no command buffer"); return }
+    pass.encode(commandBuffer: cb, cloud: cloud)
+    cb.commit()
+    cb.waitUntilCompleted()
+
+    let cptr = buf.contents()
+    var residentOK = 0, leaked = 0
+    for i in 0 ..< cloud.totalPoints {
+        let y = cptr.load(fromByteOffset: i * MemoryLayout<SIMD3<Float>>.stride + MemoryLayout<Float>.stride, as: Float.self)
+        if residentWritten.contains(i) {
+            if y == 1 { residentOK += 1 }
+        } else if y != 0 {
+            leaked += 1
+        }
+    }
+    #expect(residentOK == residentWritten.count,
+            "\(residentOK)/\(residentWritten.count) resident points displaced — a partially-resident slot pool must be fully treated")
+    #expect(leaked == 0, "\(leaked) non-resident points (unfilled tails / never-filled slots) were wrongly displaced")
+}
+
 @Test func tintReplaceDiscardAndPassthrough() {
     guard let device = MTLCreateSystemDefaultDevice() else { return }
     gpuTestLock.lock(); defer { gpuTestLock.unlock() }

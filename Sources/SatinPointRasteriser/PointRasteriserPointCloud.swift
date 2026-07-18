@@ -483,7 +483,14 @@ public final class PointRasteriserPointCloud: Object, @unchecked Sendable {
         self.sourcePointCapacity = slotCapacity * pointsPerBatch
         self.sourceBatchCapacity = slotCapacity
         self.lodCapacity = max(1, min(slotCapacity * pointsPerBatch, lodCapacity ?? (slotCapacity * pointsPerBatch)))
-        self.batchMirror = Array(repeating: RasterBatch(min: .zero, max: .zero, numPoints: 0, firstPoint: 0, fileIndex: 0, state: 0), count: slotCapacity)
+        // Seed each slot's firstPoint to its fixed pack offset (slot × pointsPerBatch)
+        // so the batch table is sorted ascending regardless of residency. The
+        // sketch-kernel binary search (scr_resolve*Thread) relies on this ordering;
+        // never-filled slots keep state 0 (correctly rejected) but must still carry
+        // a monotonic firstPoint or the search drifts past resident slots.
+        self.batchMirror = (0 ..< slotCapacity).map { slot in
+            RasterBatch(min: .zero, max: .zero, numPoints: 0, firstPoint: UInt32(slot * pointsPerBatch), fileIndex: 0, state: 0)
+        }
         self.freeSlots = Array((0 ..< slotCapacity).reversed())
         self.residentBatchCount = 0
         self.residentPointCount = 0

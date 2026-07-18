@@ -99,8 +99,9 @@ enum ScrSketchPreamble {
             }
             batch = batches[lo];
             if (batch.state == 0) return false;
-            pointIndex = id;
             localOffset = id - batch.firstPoint;
+            if (localOffset >= batch.numPoints) return false; // thread in a partially-filled slot's unwritten tail
+            pointIndex = id;
             return true;
         }
         """
