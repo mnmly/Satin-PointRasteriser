@@ -19,7 +19,7 @@ open class ResolveProcessor: BasePointRasteriserProcessor {
     public var invProjectionMatrix: simd_float4x4 = matrix_identity_float4x4 {
         didSet { set("invProjectionMatrix", invProjectionMatrix) }
     }
-    public var enablePointRejection: Bool = true {
+    public var enablePointRejection: Bool = false {
         didSet { set("enablePointRejection", enablePointRejection ? 1 : 0) }
     }
     public var rejectionConeThreshold: Float = 0.5 {

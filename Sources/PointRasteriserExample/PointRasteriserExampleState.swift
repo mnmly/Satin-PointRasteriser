@@ -100,7 +100,7 @@ final class PointRasteriserExampleState {
 
     // MARK: - Rejection / hole fill / depth test
 
-    var enablePointRejection: Bool = true
+    var enablePointRejection: Bool = false
     var rejectionConeThreshold: Float = 0.5
     var holeFillIterations: Int = 0
     var depthTolerance: Float = 0.01

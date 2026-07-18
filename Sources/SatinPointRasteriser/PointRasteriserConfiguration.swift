@@ -75,7 +75,8 @@ public struct PointRasteriserConfiguration: Sendable {
     public var depthTolerance: Float
     /// Enable the VAST 2011 screen-space occlusion operator in the merged
     /// reject+resolve pass, discarding far points that leak through gaps in a
-    /// nearer surface. See ``rejectionConeThreshold``.
+    /// nearer surface. See ``rejectionConeThreshold``. Default `false` — opt in
+    /// when leak-through of far points behind a nearer surface is objectionable.
     public var enablePointRejection: Bool
     /// Minimum empty-cone half-angle, in **radians**, for a point to be kept.
     /// A point is rejected when the largest eye-ward cone about it that is empty
@@ -143,7 +144,7 @@ public struct PointRasteriserConfiguration: Sendable {
         // VAST 2011 point-rejection controls.
         enableSimdAggregation: Bool = true,
         lodPointsPerFrame: Int = 0,
-        enablePointRejection: Bool = true,
+        enablePointRejection: Bool = false,
         rejectionConeThreshold: Float = 0.5
     ) {
         self.renderMode = renderMode
