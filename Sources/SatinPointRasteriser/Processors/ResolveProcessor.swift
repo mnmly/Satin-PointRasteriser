@@ -33,6 +33,13 @@ open class ResolveProcessor: BasePointRasteriserProcessor {
     public var coverageEnabled: Bool = false {
         didSet { set("coverageEnabled", coverageEnabled ? 1 : 0) }
     }
+    /// Relative reverse-Z band within which a nearer neighbor is treated as the
+    /// same splatted surface (not an occluder) in the rejection cone test, so
+    /// multi-pixel splats don't self-reject into black rims. Mirrors the color
+    /// pass's same-surface tolerance.
+    public var depthTolerance: Float = 0.01 {
+        didSet { set("depthTolerance", depthTolerance) }
+    }
 
     public var pixelBuffer: MTLBuffer? { didSet { set(pixelBuffer, index: .Custom0) } }
     public var outputTexture: MTLTexture? { didSet { set(outputTexture, index: .Custom0) } }
@@ -48,6 +55,7 @@ open class ResolveProcessor: BasePointRasteriserProcessor {
         set("rejectionConeThreshold", rejectionConeThreshold)
         set("isOrthographic", isOrthographic ? 1 : 0)
         set("coverageEnabled", coverageEnabled ? 1 : 0)
+        set("depthTolerance", depthTolerance)
     }
 
     open override func update(_ commandBuffer: MTLCommandBuffer, iterations: Int = 1) {

@@ -8,6 +8,9 @@
 
 // ⚠️ No inline `//` comments INSIDE this struct — Satin's uniform parser drops
 // the field after a comment (set() silently no-ops). Document fields above it.
+// `depthTolerance` is the relative reverse-Z band within which a nearer neighbor
+// is treated as the same splatted surface and excluded from the cone test, so
+// multi-pixel splats don't self-reject (mirrors the color pass semantics).
 struct NearestResolveUniforms {
     int2 screenSize;
     float4 backgroundColor;
@@ -15,6 +18,7 @@ struct NearestResolveUniforms {
     int enablePointRejection;
     float rejectionConeThreshold;
     int isOrthographic;
+    float depthTolerance;
 };
 
 // Reconstruct a view-space position from a buffer pixel + its reverse-Z depth
@@ -71,6 +75,10 @@ kernel void nearestResolveUpdate(
                 if (s.x < 0 || s.x >= screenSize.x || s.y < 0 || s.y >= screenSize.y) { continue; }
                 const uint nd = depths[uint(s.y) * uint(screenSize.x) + uint(s.x)];
                 if (nd == 0u || nd <= centerDepth) { continue; }
+                // Same-surface skip: a neighbor only a hair nearer (within the
+                // reverse-Z tolerance band) is the same multi-pixel splat surface,
+                // not an occluder — excluding it prevents self-rejection rims.
+                if (uintToDepthReverseZ(nd) <= uintToDepthReverseZ(centerDepth) * (1.0 + uniforms.depthTolerance)) { continue; }
                 const float3 pn = reconstructViewPositionU(uint2(s), nd, screenSize, uniforms.invProjectionMatrix);
                 const float3 w = pn - pc;
                 const float wl = length(w);

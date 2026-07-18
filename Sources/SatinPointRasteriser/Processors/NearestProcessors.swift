@@ -172,6 +172,12 @@ open class NearestResolveProcessor: BasePointRasteriserProcessor {
     public var isOrthographic: Bool = false {
         didSet { set("isOrthographic", isOrthographic ? 1 : 0) }
     }
+    /// Relative reverse-Z band within which a nearer neighbor is treated as the
+    /// same splatted surface (not an occluder) in the rejection cone test, so
+    /// multi-pixel splats don't self-reject into black rims.
+    public var depthTolerance: Float = 0.01 {
+        didSet { set("depthTolerance", depthTolerance) }
+    }
 
     public var depthsBuffer: MTLBuffer? { didSet { set(depthsBuffer, index: .Custom0) } }
     public var indicesBuffer: MTLBuffer? { didSet { set(indicesBuffer, index: .Custom1) } }
@@ -187,6 +193,7 @@ open class NearestResolveProcessor: BasePointRasteriserProcessor {
         set("enablePointRejection", enablePointRejection ? 1 : 0)
         set("rejectionConeThreshold", rejectionConeThreshold)
         set("isOrthographic", isOrthographic ? 1 : 0)
+        set("depthTolerance", depthTolerance)
     }
 
     open override func update(_ commandBuffer: MTLCommandBuffer, iterations: Int = 1) {

@@ -1,8 +1,11 @@
+import CoreGraphics
 import Foundation
+import ImageIO
 import Metal
 import Satin
 import simd
 import Testing
+import UniformTypeIdentifiers
 @testable import SatinPointRasteriser
 
 // End-to-end GPU verification of the minimal pipeline: LODSelect → finalize →
@@ -1087,4 +1090,153 @@ private func poolCloud(from packed: PackedPointCloud, context: Context, extraSlo
     _ = s.frame(camera: cam)
     #expect(s.rasteriser.lodSelectRanLastFrame == 1, "world transform change should re-run select")
     _ = (extraLo, extraMe, extraHi, extraCo, extraLe) // silence unused (kept for symmetry)
+}
+
+// MARK: - Slice 3: rejection self-rejection rim regression (depthTolerance)
+
+/// A single **flat** grid of near-white points, tilted so its depth varies
+/// smoothly across the surface. Multi-pixel splats tile the plane into abutting
+/// flat depth plateaus at slightly different depths — the exact input that made
+/// the VAST empty-cone operator self-reject (a farther plateau's disc has a
+/// same-surface neighbor a hair nearer → narrow cone → carved into a black rim).
+/// The `depthTolerance` same-surface skip must suppress that.
+///
+/// `tilt` is kept gentle enough that adjacent grid plateaus differ by less than
+/// the default `depthTolerance` (0.01) in reverse-Z (relative step ≈ 2.1% · tilt
+/// for this camera), so the same-surface skip covers them, yet steep enough that
+/// the plateau borders still form narrow eye-ward cones the operator rejects when
+/// the tolerance is 0. That gap is exactly what this regression exercises.
+private func tiltedWhiteGridCloud(side: Int = 40, tilt: Float = 0.35, span: Float = 0.6) -> PackedPointCloud {
+    var positions: [SIMD3<Float>] = []
+    var colors: [SIMD4<Float>] = []
+    for yi in 0 ..< side {
+        for xi in 0 ..< side {
+            let fx = Float(xi) / Float(side - 1) * 2 - 1  // -1 … 1
+            let fy = Float(yi) / Float(side - 1) * 2 - 1
+            positions.append([fx * span, fy * span, fy * tilt]) // depth ramps with y
+            colors.append([0.95, 0.95, 0.95, 1])
+        }
+    }
+    return PackedPointCloudFixtures.pack(positions: positions, colors: colors, shuffleBatches: false)
+}
+
+private extension RenderResult {
+    /// Pixels lit in `baseline` but turned to transparent background in `self`
+    /// — i.e. carved by point rejection. For a single flat surface this is the
+    /// self-rejection rim count (should be ~0 once the tolerance skip is active).
+    func carvedPixelCount(vs baseline: RenderResult) -> Int {
+        var n = 0
+        for i in 0 ..< (width * height) where baseline.rgba[i * 4 + 3] > 0 && rgba[i * 4 + 3] == 0 { n += 1 }
+        return n
+    }
+}
+
+/// Write an RGBA8 buffer to a PNG (best-effort; used only for evidence dumps).
+@discardableResult
+private func dumpPNG(_ r: RenderResult, to url: URL) -> Bool {
+    let cs = CGColorSpaceCreateDeviceRGB()
+    guard let ctx = CGContext(
+        data: nil, width: r.width, height: r.height, bitsPerComponent: 8, bytesPerRow: r.width * 4,
+        space: cs, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ) else { return false }
+    r.rgba.withUnsafeBytes { _ = memcpy(ctx.data!, $0.baseAddress!, r.width * r.height * 4) }
+    guard let img = ctx.makeImage(),
+          let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)
+    else { return false }
+    CGImageDestinationAddImage(dest, img, nil)
+    return CGImageDestinationFinalize(dest)
+}
+
+/// (a) A tilted flat white grid at a large point size must render with point
+/// rejection on essentially identically to rejection off — no self-rejected
+/// black rims. Rendered three ways to prove the mechanism directly:
+///   - rejection OFF          → the fully lit surface (baseline)
+///   - rejection ON, tol = 0  → reproduces the bug (same-surface plateau borders
+///                              carved into a rim)
+///   - rejection ON, tol = default 0.01 → the fix (rim suppressed)
+@Test func pointRejectionDoesNotCarveFlatSurfaceRims() {
+    guard let device = MTLCreateSystemDefaultDevice() else { return }
+    gpuTestLock.lock(); defer { gpuTestLock.unlock() }
+    let cloud = tiltedWhiteGridCloud()
+
+    // Large multi-pixel splats, hole fill off, CLOD off: the only thing that
+    // varies across the three renders is rejection + depthTolerance.
+    let base: (PointRasteriser) -> Void = { r in
+        r.configuration.enableCLOD = false
+        r.configuration.holeFillIterations = 0
+        r.configuration.pointSizeMode = .screenSpace
+        r.configuration.minimumPointSize = 40
+        r.configuration.maximumPointSize = 40
+        r.configuration.pointSizeScale = 1
+    }
+
+    guard let off = renderOffscreen(device: device, width: 512, height: 512, packed: cloud, configure: { r in
+        base(r); r.configuration.enablePointRejection = false
+    }, placeCamera: { $0.lookAt(target: .zero) }),
+    let bug = renderOffscreen(device: device, width: 512, height: 512, packed: cloud, configure: { r in
+        base(r); r.configuration.enablePointRejection = true; r.configuration.depthTolerance = 0
+    }, placeCamera: { $0.lookAt(target: .zero) }),
+    let fixed = renderOffscreen(device: device, width: 512, height: 512, packed: cloud, configure: { r in
+        base(r); r.configuration.enablePointRejection = true; r.configuration.depthTolerance = 0.01
+    }, placeCamera: { $0.lookAt(target: .zero) }) else {
+        Issue.record("failed to render tilted white grid")
+        return
+    }
+
+    let lit = off.coveredPixelCount
+    let rimBug = bug.carvedPixelCount(vs: off)
+    let rimFixed = fixed.carvedPixelCount(vs: off)
+
+    if let dir = ProcessInfo.processInfo.environment["PR_DUMP_DIR"] {
+        let d = URL(fileURLWithPath: dir)
+        dumpPNG(off, to: d.appendingPathComponent("fixed_rejection_off.png"))
+        dumpPNG(fixed, to: d.appendingPathComponent("fixed_rejection_on.png"))
+        dumpPNG(bug, to: d.appendingPathComponent("bug_rejection_on_tol0.png"))
+        print("[rim-regression] lit=\(lit) rimBug(tol0)=\(rimBug) rimFixed(tol0.01)=\(rimFixed)")
+    }
+
+    #expect(lit > 10_000, "sanity: flat grid should cover a large area, got \(lit) lit px")
+    // With tolerance 0 the operator self-rejects a large plateau-border rim.
+    #expect(rimBug > lit / 20, "expected a self-rejection rim with tol=0, got \(rimBug) of \(lit) lit")
+    // The default tolerance suppresses essentially all of it.
+    #expect(rimFixed < lit / 200,
+            "fix left flat-surface rim: \(rimFixed) of \(lit) lit (bug rim was \(rimBug))")
+    #expect(rimFixed < rimBug / 20,
+            "fix did not substantially reduce rim (bug=\(rimBug) fixed=\(rimFixed))")
+}
+
+/// (b) The tolerance skip must NOT disable genuine occlusion rejection: two
+/// surfaces separated by depth far larger than depthTolerance still get the
+/// leaking-far-plane pixels carved. Guards against the fix skipping everything.
+@Test func pointRejectionStillCarvesGenuineOcclusionWithTolerance() {
+    guard let device = MTLCreateSystemDefaultDevice() else { return }
+    gpuTestLock.lock(); defer { gpuTestLock.unlock() }
+    let cloud = twoPlanesCloud()
+
+    let setup: (PointRasteriser) -> Void = { r in
+        r.configuration.enableCLOD = false
+        r.configuration.holeFillIterations = 0
+        r.configuration.pointSizeMode = .screenSpace
+        r.configuration.minimumPointSize = 1
+        r.configuration.maximumPointSize = 1
+        r.configuration.pointSizeScale = 1
+        // Default depthTolerance 0.01: planes at z=+0.25 / z=-0.5 are separated
+        // far beyond it, so the same-surface skip must not exempt the leak.
+    }
+
+    guard let off = renderOffscreen(device: device, width: 256, height: 256, packed: cloud, configure: { r in
+        setup(r); r.configuration.enablePointRejection = false
+    }, placeCamera: { $0.lookAt(target: .zero) }),
+    let on = renderOffscreen(device: device, width: 256, height: 256, packed: cloud, configure: { r in
+        setup(r); r.configuration.enablePointRejection = true
+    }, placeCamera: { $0.lookAt(target: .zero) }) else {
+        Issue.record("failed to render two-plane occlusion scene")
+        return
+    }
+
+    let greenOff = off.greenPixelCount(inCenterHalfExtent: 64)
+    let greenOn = on.greenPixelCount(inCenterHalfExtent: 64)
+    #expect(greenOff > 100, "expected far-plane leakage with rejection off, got \(greenOff)")
+    #expect(Float(greenOn) < 0.75 * Float(greenOff),
+            "tolerance skip disabled genuine occlusion rejection (off=\(greenOff) on=\(greenOn))")
 }

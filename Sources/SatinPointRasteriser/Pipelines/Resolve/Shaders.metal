@@ -21,6 +21,9 @@
 // `invProjectionMatrix` maps clip → view for depth reconstruction.
 // `rejectionConeThreshold` is the minimum empty-cone half-angle in radians.
 // `isOrthographic` selects a constant eye-ward axis (parallel rays).
+// `depthTolerance` is the relative reverse-Z band within which a nearer
+// neighbor is treated as the same splatted surface (mirrors the color pass) and
+// excluded from the cone test, so multi-pixel splats don't self-reject.
 struct ResolveUniforms {
     int2 screenSize;
     float4 backgroundColor;
@@ -29,6 +32,7 @@ struct ResolveUniforms {
     float rejectionConeThreshold;
     int isOrthographic;
     int coverageEnabled;
+    float depthTolerance;
 };
 
 // Reconstruct a view-space position from a buffer pixel + its reverse-Z depth.
@@ -101,6 +105,12 @@ kernel void resolveUpdate(
                 // Reverse-Z: larger depth uint == nearer the eye. Only closer
                 // neighbors can occlude this point.
                 if (np.depth <= pixel.depth) { continue; }
+                // Same-surface skip: multi-pixel splats tile flat depth plateaus
+                // that abut at slightly different depths. A neighbor only a hair
+                // nearer (within the reverse-Z tolerance band, matching the color
+                // pass's same-surface semantics) is the same surface, not an
+                // occluder — excluding it prevents self-rejection black rims.
+                if (uintToDepthReverseZ(np.depth) <= uintToDepthReverseZ(pixel.depth) * (1.0 + uniforms.depthTolerance)) { continue; }
 
                 const float3 pn = reconstructViewPosition(uint2(s), np.depth, screenSize, uniforms.invProjectionMatrix);
                 const float3 w = pn - pc;

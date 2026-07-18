@@ -282,6 +282,7 @@ public final class PointRasteriser: Object, @unchecked Sendable {
         resolveProcessor.invProjectionMatrix = invProjection
         resolveProcessor.enablePointRejection = configuration.enablePointRejection
         resolveProcessor.rejectionConeThreshold = configuration.rejectionConeThreshold
+        resolveProcessor.depthTolerance = configuration.depthTolerance
         resolveProcessor.isOrthographic = isOrthographic
         resolveProcessor.coverageEnabled = coverage
 
@@ -298,6 +299,7 @@ public final class PointRasteriser: Object, @unchecked Sendable {
         nearestResolveProcessor.invProjectionMatrix = invProjection
         nearestResolveProcessor.enablePointRejection = configuration.enablePointRejection
         nearestResolveProcessor.rejectionConeThreshold = configuration.rejectionConeThreshold
+        nearestResolveProcessor.depthTolerance = configuration.depthTolerance
         nearestResolveProcessor.isOrthographic = isOrthographic
 
         applySimdAggregationDefine()
