@@ -70,12 +70,11 @@ inline int pointFootprintRadius(
             pointSize = 2.0 * pointSizeScale * focal / viewZ;
         }
     } else {
-        if (ortho) {
-            pointSize = pointSizeScale;
-        } else {
-            const float viewDistance = max(length(viewPos.xyz), 0.000001);
-            pointSize = pointSizeScale / viewDistance;
-        }
+        // Screen space: a fixed on-screen size, in pixels, independent of depth
+        // (pointSizeScale is the px diameter before the Min…Max clamp). No
+        // distance falloff in either projection — world-space mode is the
+        // physically-attenuated path.
+        pointSize = pointSizeScale;
     }
     if (!isfinite(pointSize)) {
         pointSize = lo;
