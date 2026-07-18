@@ -31,6 +31,7 @@ struct ColorPassUniforms {
     float motionBlur;
     int motionBlurSamples;
     float motionBlurMaxSpread;
+    int antialiasEdges;
 };
 
 kernel void colorPassUpdate(
@@ -50,7 +51,7 @@ kernel void colorPassUpdate(
     const uint count = lodStats[2];
     const bool coverageMode = (uniforms.applyTint != 0 && uniforms.tintAlphaIsCoverage != 0);
     const bool motionBlurOn = uniforms.motionBlur > 0.0;
-    const bool anyFeature = (uniforms.applyDisplacement != 0) || (uniforms.applyTint != 0) || motionBlurOn;
+    const bool anyFeature = (uniforms.applyDisplacement != 0) || (uniforms.applyTint != 0) || motionBlurOn || (uniforms.antialiasEdges != 0);
 
 #if PR_SIMD_AGGREGATION
     if (!anyFeature) {
@@ -188,12 +189,16 @@ kernel void colorPassUpdate(
         }
     }
 
+    const bool aa = uniforms.antialiasEdges != 0;
     const float aN = a / float(mbSamples);
     const float kS = 4096.0;
-    const uint caR = uint(float(r) * (1.0 / 255.0) * aN * kS + 0.5);
-    const uint caG = uint(float(g) * (1.0 / 255.0) * aN * kS + 0.5);
-    const uint caB = uint(float(b) * (1.0 / 255.0) * aN * kS + 0.5);
-    const uint caA = uint(aN * kS + 0.5);
+    // Constant fixed-point contribution for the OIT path (per-pixel weight = aN).
+    const uint caR0 = uint(float(r) * (1.0 / 255.0) * aN * kS + 0.5);
+    const uint caG0 = uint(float(g) * (1.0 / 255.0) * aN * kS + 0.5);
+    const uint caB0 = uint(float(b) * (1.0 / 255.0) * aN * kS + 0.5);
+    const uint caA0 = uint(aN * kS + 0.5);
+    // Normalized color for the edge-AA path (per-pixel coverage weight).
+    const float3 cN = float3(float(r), float(g), float(b)) * (1.0 / 255.0);
 
     for (int s = 0; s < mbSamples; s++) {
         const int2 center = pixelCoord - int2(round(mbStep * float(s)));
@@ -204,21 +209,32 @@ kernel void colorPassUpdate(
                 if (target.x < 0 || target.x >= uniforms.screenSize.x || target.y < 0 || target.y >= uniforms.screenSize.y) { continue; }
                 const uint pixelIndex = uint(target.y * uniforms.screenSize.x + target.x);
 
-                if (oit) {
-                    atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].red, caR, memory_order_relaxed);
-                    atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].green, caG, memory_order_relaxed);
-                    atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].blue, caB, memory_order_relaxed);
-                    atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].count, caA, memory_order_relaxed);
-                    continue;
+                // Opaque accumulation (incl. edge-AA) is depth-tested; OIT is not.
+                if (!oit) {
+                    const uint cd = pixels[pixelIndex].depth;
+                    if (cd == 0u) { continue; }
+                    if (ndcZ < uintToDepthReverseZ(cd) * (1.0 - uniforms.depthTolerance)) { continue; }
                 }
 
-                const uint cd = pixels[pixelIndex].depth;
-                if (cd == 0u) { continue; }
-                if (ndcZ < uintToDepthReverseZ(cd) * (1.0 - uniforms.depthTolerance)) { continue; }
-                atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].red, r, memory_order_relaxed);
-                atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].green, g, memory_order_relaxed);
-                atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].blue, b, memory_order_relaxed);
-                atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].count, 1u, memory_order_relaxed);
+                if (aa) {
+                    const float cov = pointFootprintCoverage(int2(ox, oy), radius);
+                    if (cov <= 0.0) { continue; }
+                    const float w = cov * aN;
+                    atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].red, uint(cN.x * w * kS + 0.5), memory_order_relaxed);
+                    atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].green, uint(cN.y * w * kS + 0.5), memory_order_relaxed);
+                    atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].blue, uint(cN.z * w * kS + 0.5), memory_order_relaxed);
+                    atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].count, uint(w * kS + 0.5), memory_order_relaxed);
+                } else if (oit) {
+                    atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].red, caR0, memory_order_relaxed);
+                    atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].green, caG0, memory_order_relaxed);
+                    atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].blue, caB0, memory_order_relaxed);
+                    atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].count, caA0, memory_order_relaxed);
+                } else {
+                    atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].red, r, memory_order_relaxed);
+                    atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].green, g, memory_order_relaxed);
+                    atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].blue, b, memory_order_relaxed);
+                    atomic_fetch_add_explicit((device atomic_uint *)&pixels[pixelIndex].count, 1u, memory_order_relaxed);
+                }
             }
         }
     }

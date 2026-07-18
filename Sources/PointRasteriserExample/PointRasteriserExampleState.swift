@@ -79,6 +79,8 @@ final class PointRasteriserExampleState {
     var minimumPointSize: Float = 1.0
     var maximumPointSize: Float = 6.0
     var pointSizeScale: Float = 5.0
+    /// Analytic per-point edge antialiasing (soft ~1px disc silhouette).
+    var pointEdgeAntialiasing: Bool = false
 
     // MARK: - LOD & culling
 
@@ -171,7 +173,8 @@ final class PointRasteriserExampleState {
             enableSimdAggregation: enableSimdAggregation,
             lodPointsPerFrame: lodPointsPerFrame,
             enablePointRejection: enablePointRejection,
-            rejectionConeThreshold: rejectionConeThreshold
+            rejectionConeThreshold: rejectionConeThreshold,
+            pointEdgeAntialiasing: pointEdgeAntialiasing
         )
     }
 }

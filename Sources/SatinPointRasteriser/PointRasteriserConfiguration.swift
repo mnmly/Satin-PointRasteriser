@@ -109,6 +109,15 @@ public struct PointRasteriserConfiguration: Sendable {
     public var motionBlurSamples: Int
     /// Clamp on the motion-blur smear length in pixels.
     public var motionBlurMaxSpread: Float
+    /// Analytic per-point edge antialiasing (high-quality-average mode only).
+    /// When `true`, the color pass weights each splat pixel by its circular
+    /// coverage — a ~1px soft edge — and the resolve emits that coverage as
+    /// output alpha, so disc silhouettes composite smoothly over the scene
+    /// instead of showing hard aliased edges. Independent of ``renderScale``
+    /// supersampling and far cheaper. Routes the color pass through its
+    /// per-point loop (skips the SIMD-aggregation fast path), a small throughput
+    /// cost. Default `false`.
+    public var pointEdgeAntialiasing: Bool
 
     /// Creates a configuration; defaults render the fixture clouds sensibly.
     // Parameter order intentionally matches Satin-ComputeRasteriser's
@@ -145,7 +154,8 @@ public struct PointRasteriserConfiguration: Sendable {
         enableSimdAggregation: Bool = true,
         lodPointsPerFrame: Int = 0,
         enablePointRejection: Bool = false,
-        rejectionConeThreshold: Float = 0.5
+        rejectionConeThreshold: Float = 0.5,
+        pointEdgeAntialiasing: Bool = false
     ) {
         self.renderMode = renderMode
         self.enableSimdAggregation = enableSimdAggregation
@@ -172,5 +182,6 @@ public struct PointRasteriserConfiguration: Sendable {
         self.motionBlur = motionBlur
         self.motionBlurSamples = motionBlurSamples
         self.motionBlurMaxSpread = motionBlurMaxSpread
+        self.pointEdgeAntialiasing = pointEdgeAntialiasing
     }
 }

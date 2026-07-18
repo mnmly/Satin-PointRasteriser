@@ -42,6 +42,8 @@ struct PointRasteriserSettingsView: View {
                         range: appState.pointSizeMode == .worldSpace ? 0.001 ... 0.1 : 1 ... 16,
                         formatter: { String(format: appState.pointSizeMode == .worldSpace ? "%.3f" : "%.1f", $0) }
                     )
+
+                    Toggle("Edge antialiasing", isOn: $appState.pointEdgeAntialiasing)
                 }
 
                 Section("LOD & culling") {

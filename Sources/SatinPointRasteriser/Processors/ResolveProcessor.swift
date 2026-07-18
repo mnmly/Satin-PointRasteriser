@@ -40,6 +40,12 @@ open class ResolveProcessor: BasePointRasteriserProcessor {
     public var depthTolerance: Float = 0.01 {
         didSet { set("depthTolerance", depthTolerance) }
     }
+    /// Resolve the coverage-weighted accumulation with linear-coverage alpha
+    /// (analytic per-point edge antialiasing). Mutually superseded by
+    /// ``coverageEnabled`` (OIT), which resolves earlier.
+    public var edgeAntialias: Bool = false {
+        didSet { set("edgeAntialias", edgeAntialias ? 1 : 0) }
+    }
 
     public var pixelBuffer: MTLBuffer? { didSet { set(pixelBuffer, index: .Custom0) } }
     public var outputTexture: MTLTexture? { didSet { set(outputTexture, index: .Custom0) } }
@@ -56,6 +62,7 @@ open class ResolveProcessor: BasePointRasteriserProcessor {
         set("isOrthographic", isOrthographic ? 1 : 0)
         set("coverageEnabled", coverageEnabled ? 1 : 0)
         set("depthTolerance", depthTolerance)
+        set("edgeAntialias", edgeAntialias ? 1 : 0)
     }
 
     open override func update(_ commandBuffer: MTLCommandBuffer, iterations: Int = 1) {

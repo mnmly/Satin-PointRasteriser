@@ -1386,3 +1386,96 @@ private func dumpPNG(_ r: RenderResult, to url: URL) -> Bool {
     #expect(Float(greenOn) < 0.75 * Float(greenOff),
             "tolerance skip disabled genuine occlusion rejection (off=\(greenOff) on=\(greenOn))")
 }
+
+// MARK: - Analytic per-point edge antialiasing
+
+private func singlePointCloud(color: SIMD4<Float> = [1, 1, 1, 1]) -> PackedPointCloud {
+    PackedPointCloudFixtures.pack(positions: [[0, 0, 0]], colors: [color], shuffleBatches: false)
+}
+
+/// Composite the resolved (straight-alpha) output over a dark background and
+/// write an opaque PNG to the temp dir. Env-gated (`SATIN_AA_DUMP=1`) so the
+/// committed test has no file-system side effects by default.
+private func dumpCompositedPNG(_ r: RenderResult, named name: String) {
+    let bg = SIMD3<Double>(28, 28, 36)
+    var pix = [UInt8](repeating: 0, count: r.width * r.height * 4)
+    for i in 0 ..< (r.width * r.height) {
+        let a = Double(r.rgba[i * 4 + 3]) / 255.0
+        for c in 0 ..< 3 {
+            let src = Double(r.rgba[i * 4 + c])
+            pix[i * 4 + c] = UInt8(max(0, min(255, src * a + bg[c] * (1 - a))))
+        }
+        pix[i * 4 + 3] = 255
+    }
+    let cs = CGColorSpaceCreateDeviceRGB()
+    guard let ctx = CGContext(
+        data: &pix, width: r.width, height: r.height, bitsPerComponent: 8,
+        bytesPerRow: r.width * 4, space: cs,
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ), let image = ctx.makeImage() else { return }
+    let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(name)
+    guard let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else { return }
+    CGImageDestinationAddImage(dest, image, nil)
+    CGImageDestinationFinalize(dest)
+    FileHandle.standardError.write("SATIN_AA_DUMP wrote \(url.path)\n".data(using: .utf8)!)
+}
+
+/// A single large screen-space disc: with edge AA off the silhouette is a hard
+/// binary circle (every covered pixel fully opaque); with it on the outer ring
+/// gains fractional coverage (partial alpha) while the interior stays opaque.
+@Test func edgeAntialiasingSoftensDiscSilhouette() {
+    guard let device = MTLCreateSystemDefaultDevice() else { return }
+    gpuTestLock.lock(); defer { gpuTestLock.unlock() }
+
+    let cloud = singlePointCloud()
+    func render(_ aa: Bool) -> RenderResult? {
+        renderOffscreen(device: device, width: 128, height: 128, packed: cloud, configure: { r in
+            r.configuration.enableCLOD = false
+            r.configuration.pointSizeMode = .screenSpace
+            r.configuration.pointSizeScale = 40 // radius clamps to 16 → ~33px disc
+            r.configuration.pointEdgeAntialiasing = aa
+        }, placeCamera: { $0.lookAt(target: .zero) })
+    }
+
+    guard let off = render(false), let on = render(true) else {
+        Issue.record("failed to render single-point scene"); return
+    }
+
+    func partialAlphaCount(_ r: RenderResult) -> Int {
+        var n = 0
+        for i in 0 ..< (r.width * r.height) {
+            let a = r.rgba[i * 4 + 3]
+            if a > 0 && a < 255 { n += 1 }
+        }
+        return n
+    }
+    func centerMaxAlpha(_ r: RenderResult) -> UInt8 {
+        var m: UInt8 = 0
+        let cx = r.width / 2, cy = r.height / 2
+        for y in (cy - 3) ... (cy + 3) {
+            for x in (cx - 3) ... (cx + 3) { m = max(m, r.alpha(x, y)) }
+        }
+        return m
+    }
+
+    if ProcessInfo.processInfo.environment["SATIN_AA_DUMP"] == "1" {
+        dumpCompositedPNG(off, named: "aa_off.png")
+        dumpCompositedPNG(on, named: "aa_on.png")
+    }
+
+    // Both render a comparable disc (AA doesn't drop or shrink the point away).
+    #expect(off.coveredPixelCount > 300, "expected a large disc, got \(off.coveredPixelCount)")
+    #expect(on.coveredPixelCount > 300, "AA disc collapsed, got \(on.coveredPixelCount)")
+
+    // AA off: hard binary silhouette — no fractional-coverage pixels at all.
+    #expect(partialAlphaCount(off) == 0,
+            "AA off should have no partial-alpha edge pixels, got \(partialAlphaCount(off))")
+
+    // AA on: the silhouette ring is softened with many fractional-alpha pixels.
+    #expect(partialAlphaCount(on) > 20,
+            "AA on should soften the edge, got \(partialAlphaCount(on)) partial pixels")
+
+    // Interior stays fully opaque under AA (coverage saturates to 1).
+    #expect(centerMaxAlpha(on) == 255,
+            "disc interior should stay opaque under AA, got \(centerMaxAlpha(on))")
+}

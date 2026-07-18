@@ -24,6 +24,9 @@
 // `depthTolerance` is the relative reverse-Z band within which a nearer
 // neighbor is treated as the same splatted surface (mirrors the color pass) and
 // excluded from the cone test, so multi-pixel splats don't self-reject.
+// `edgeAntialias` selects the coverage-weighted opaque resolve: colour is the
+// coverage-weighted average and alpha is the accumulated linear coverage
+// (saturated), so partially-covered silhouette pixels composite softly.
 struct ResolveUniforms {
     int2 screenSize;
     float4 backgroundColor;
@@ -33,6 +36,7 @@ struct ResolveUniforms {
     int isOrthographic;
     int coverageEnabled;
     float depthTolerance;
+    int edgeAntialias;
 };
 
 // Reconstruct a view-space position from a buffer pixel + its reverse-Z depth.
@@ -127,6 +131,19 @@ kernel void resolveUpdate(
             depthTexture.write(float4(0.0), gid);
             return;
         }
+    }
+
+    if (uniforms.edgeAntialias != 0) {
+        // Edge-antialiased opaque resolve. The color pass accumulated
+        // Σ(colorNorm·coverage·S) into rgb and Σ(coverage·S) into count (fixed
+        // point S=4096). Color = rgb/count (S cancels → coverage-weighted average,
+        // already 0…1). Alpha = saturate(Σcoverage): interiors reach 1 (opaque),
+        // silhouette pixels stay fractional and composite softly over the scene.
+        const float3 rgb = float3(pixel.red, pixel.green, pixel.blue) / float(pixel.count);
+        const float sumCoverage = float(pixel.count) * (1.0 / 4096.0);
+        outputTexture.write(float4(rgb, saturate(sumCoverage)), gid);
+        depthTexture.write(float4(uintToDepthReverseZ(pixel.depth)), gid);
+        return;
     }
 
     const float invCount = 1.0 / float(pixel.count);

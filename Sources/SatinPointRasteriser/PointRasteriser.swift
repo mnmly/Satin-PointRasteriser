@@ -305,6 +305,7 @@ public final class PointRasteriser: Object, @unchecked Sendable {
         colorProcessor.depthTolerance = configuration.depthTolerance
         colorProcessor.colorizeChunks = configuration.colorizeChunks
         colorProcessor.colorizeOverdraw = configuration.colorizeOverdraw
+        colorProcessor.antialiasEdges = configuration.pointEdgeAntialiasing
 
         // Per-point feature flags (identical on depth + color so occlusion agrees).
         let motionBlurOn = configuration.motionBlur > 0
@@ -328,6 +329,7 @@ public final class PointRasteriser: Object, @unchecked Sendable {
         resolveProcessor.depthTolerance = configuration.depthTolerance
         resolveProcessor.isOrthographic = isOrthographic
         resolveProcessor.coverageEnabled = coverage
+        resolveProcessor.edgeAntialias = configuration.pointEdgeAntialiasing
 
         // Nearest-mode processors share the projection / point-size uniforms.
         for processor in [nearestWinner64Processor, nearestDepthProcessor, nearestIndexProcessor] as [NearestRasterProcessor] {
@@ -946,6 +948,7 @@ public final class PointRasteriser: Object, @unchecked Sendable {
         colorProcessor.depthTolerance = configuration.depthTolerance
         colorProcessor.colorizeChunks = configuration.colorizeChunks
         colorProcessor.colorizeOverdraw = configuration.colorizeOverdraw
+        colorProcessor.antialiasEdges = configuration.pointEdgeAntialiasing
         nearestResolveProcessor.backgroundColor = configuration.backgroundColor
         applySimdAggregationDefine()
     }

@@ -53,6 +53,11 @@ open class ColorPassProcessor: BasePointRasteriserProcessor {
     public var motionBlurMaxSpread: Float = 64.0 {
         didSet { set("motionBlurMaxSpread", motionBlurMaxSpread) }
     }
+    /// Analytic per-point edge antialiasing: weight each splat pixel by its
+    /// circular coverage and accumulate coverage-weighted fixed-point color.
+    public var antialiasEdges: Bool = false {
+        didSet { set("antialiasEdges", antialiasEdges ? 1 : 0) }
+    }
 
     public var lodPositionsBuffer: MTLBuffer? { didSet { set(lodPositionsBuffer, index: .Custom0) } }
     public var lodColorsBuffer: MTLBuffer? { didSet { set(lodColorsBuffer, index: .Custom1) } }
@@ -97,6 +102,7 @@ open class ColorPassProcessor: BasePointRasteriserProcessor {
         set("motionBlur", motionBlur)
         set("motionBlurSamples", motionBlurSamples)
         set("motionBlurMaxSpread", motionBlurMaxSpread)
+        set("antialiasEdges", antialiasEdges ? 1 : 0)
     }
 
     var isEncodeReady: Bool {

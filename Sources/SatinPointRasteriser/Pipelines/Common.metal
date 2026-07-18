@@ -95,6 +95,21 @@ inline bool insidePointFootprint(int2 offset, int radius) {
     return dot(p, p) <= r * r;
 }
 
+// Analytic edge coverage of a splat pixel in [0,1]: 1 across the disc interior,
+// ramping linearly to 0 over the outermost ~1px so silhouettes antialias. The
+// ramp lives entirely inside the binary `insidePointFootprint` boundary
+// (r = radius + 0.5), so the depth pass footprint is unchanged and every
+// AA-weighted color pixel still has a depth written under it. Sub-pixel points
+// (radius <= 0) stay fully covered — they must not fade toward invisibility.
+inline float pointFootprintCoverage(int2 offset, int radius) {
+    if (radius <= 0) {
+        return (offset.x == 0 && offset.y == 0) ? 1.0 : 0.0;
+    }
+    const float d = length(float2(offset));
+    const float r = float(radius) + 0.5;
+    return saturate(r - d);
+}
+
 inline float3 batchMin(RasterBatch batch) {
     return float3(batch.minX, batch.minY, batch.minZ);
 }
