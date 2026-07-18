@@ -110,32 +110,41 @@ public struct PointRasteriserConfiguration: Sendable {
     public var motionBlurMaxSpread: Float
 
     /// Creates a configuration; defaults render the fixture clouds sensibly.
+    // Parameter order intentionally matches Satin-ComputeRasteriser's
+    // `ComputeRasteriserConfiguration.init` for the shared fields, with the
+    // PointRasteriser-only additions appended at the end. Swift requires
+    // provided arguments to follow declaration order even when all are
+    // defaulted, so this ordering is what lets CR-style call sites (a subset of
+    // labels in CR order) compile unchanged against PointRasteriser.
     public init(
         renderMode: RenderMode = .highQualityAverage,
-        enableSimdAggregation: Bool = true,
+        depthTolerance: Float = 0.01,
+        backgroundColor: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0),
+        enableFrustumCulling: Bool = true,
+        lodBias: Int = 0,
+        enableCLOD: Bool = true,
+        enableLODDither: Bool = true,
+        holeFillIterations: Int = 0,
+        colorizeChunks: Bool = false,
+        colorizeOverdraw: Bool = false,
         pointSizeMode: PointSizeMode = .screenSpace,
         minimumPointSize: Float = 1.0,
         maximumPointSize: Float = 5.0,
         pointSizeScale: Float = 5.0,
-        enableFrustumCulling: Bool = true,
-        enableCLOD: Bool = true,
-        lodBias: Int = 0,
-        enableLODDither: Bool = true,
-        lodPointsPerFrame: Int = 0,
-        backgroundColor: SIMD4<Float> = SIMD4<Float>(0, 0, 0, 0),
-        depthTolerance: Float = 0.01,
-        enablePointRejection: Bool = true,
-        rejectionConeThreshold: Float = 0.5,
-        holeFillIterations: Int = 0,
-        colorizeChunks: Bool = false,
-        colorizeOverdraw: Bool = false,
-        writesSceneDepth: Bool = true,
         applyDisplacement: Bool = false,
         applyTint: Bool = false,
         tintAlphaIsCoverage: Bool = false,
+        writesSceneDepth: Bool = true,
         motionBlur: Float = 0.0,
         motionBlurSamples: Int = 8,
-        motionBlurMaxSpread: Float = 64.0
+        motionBlurMaxSpread: Float = 64.0,
+        // PointRasteriser-only additions (appended so CR-style calls keep working):
+        // SIMD-group pre-aggregation, amortized-LOD per-frame budget, and the
+        // VAST 2011 point-rejection controls.
+        enableSimdAggregation: Bool = true,
+        lodPointsPerFrame: Int = 0,
+        enablePointRejection: Bool = true,
+        rejectionConeThreshold: Float = 0.5
     ) {
         self.renderMode = renderMode
         self.enableSimdAggregation = enableSimdAggregation

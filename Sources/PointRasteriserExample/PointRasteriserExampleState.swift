@@ -144,27 +144,27 @@ final class PointRasteriserExampleState {
     func makeConfiguration() -> PointRasteriserConfiguration {
         PointRasteriserConfiguration(
             renderMode: renderMode,
-            enableSimdAggregation: enableSimdAggregation,
+            depthTolerance: depthTolerance,
+            backgroundColor: backgroundColor,
+            enableFrustumCulling: enableFrustumCulling,
+            lodBias: lodBias,
+            enableCLOD: enableCLOD,
+            enableLODDither: enableLODDither,
+            holeFillIterations: holeFillIterations,
+            colorizeChunks: colorizeChunks,
+            colorizeOverdraw: colorizeOverdraw,
             pointSizeMode: pointSizeMode,
             minimumPointSize: minimumPointSize,
             maximumPointSize: maximumPointSize,
             pointSizeScale: pointSizeScale,
-            enableFrustumCulling: enableFrustumCulling,
-            enableCLOD: enableCLOD,
-            lodBias: lodBias,
-            enableLODDither: enableLODDither,
-            lodPointsPerFrame: lodPointsPerFrame,
-            backgroundColor: backgroundColor,
-            depthTolerance: depthTolerance,
-            enablePointRejection: enablePointRejection,
-            rejectionConeThreshold: rejectionConeThreshold,
-            holeFillIterations: holeFillIterations,
-            colorizeChunks: colorizeChunks,
-            colorizeOverdraw: colorizeOverdraw,
             writesSceneDepth: writesSceneDepth,
             motionBlur: motionBlur,
             motionBlurSamples: motionBlurSamples,
-            motionBlurMaxSpread: motionBlurMaxSpread
+            motionBlurMaxSpread: motionBlurMaxSpread,
+            enableSimdAggregation: enableSimdAggregation,
+            lodPointsPerFrame: lodPointsPerFrame,
+            enablePointRejection: enablePointRejection,
+            rejectionConeThreshold: rejectionConeThreshold
         )
     }
 }
