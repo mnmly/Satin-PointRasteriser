@@ -33,6 +33,110 @@ public enum PointRasteriserStreamingProjection {
     }
 }
 
+/// Why a settled residency target stopped short of full coverage.
+///
+/// A settled frame is either fully covered or clamped; when clamped, the two
+/// causes are independent and can co-occur:
+/// * `byBudget` — the driver's byte budget excluded frustum-visible candidates
+///   (mirrors ``StreamingAdapter/residencyBudgetLimited``). Raise
+///   ``StreamingAdapter/setBudget(bytes:)`` for fuller coverage.
+/// * `byPool` — the GPU upload backlog is permanently blocked on a full slot
+///   pool (mirrors ``StreamingAdapter/uploadBlockedOnFullPool``). Raise the
+///   ``PointRasteriserPointCloud`` slot capacity.
+public enum StreamingResidencyCoverage: Equatable, Sendable {
+    /// Every wanted chunk for the submitted views is resident and uploaded.
+    case full
+    /// Settled short of full: the wanted set was clamped. `byBudget` = the
+    /// driver's budget excluded frustum-visible candidates; `byPool` = the
+    /// upload backlog is blocked on a full slot pool.
+    case clamped(byBudget: Bool, byPool: Bool)
+}
+
+/// Typed settle state for a streaming residency target — the structured form of
+/// ``StreamingAdapter/isCaughtUp`` plus its two clamp flags. Derived purely from
+/// existing adapter members; see ``StreamingAdapter/residencyState``.
+public enum StreamingResidencyState: Equatable, Sendable {
+    /// Still streaming toward the submitted target.
+    case streaming
+    /// Nothing more will change for the submitted target at the current budget.
+    case settled(StreamingResidencyCoverage)
+}
+
+/// An immutable, `Sendable` snapshot of the adapter's residency + decode
+/// telemetry, replacing the pile of individually-read properties.
+///
+/// Every field is a copy taken at snapshot time; the struct holds no reference
+/// to the adapter. Like the individual telemetry properties it is sourced from,
+/// it **must be read on the same thread that calls ``StreamingAdapter/pump()``**
+/// (see the "Telemetry (read on the main thread)" MARK in ``StreamingAdapter``)
+/// — the underlying counters are mutated by `pump()` without synchronization.
+public struct StreamingResidencyTelemetry: Sendable {
+    /// Typed settle state (``StreamingAdapter/residencyState``).
+    public var state: StreamingResidencyState
+    /// Slot-pool capacity in whole batches (`cloud.batchCount`).
+    public var poolCapacity: Int
+    /// Free (unallocated) slots in the pool (`cloud.freeSlotCount`).
+    public var freeSlots: Int
+    /// Chunks currently resident in the slot pool.
+    public var residentChunks: Int
+    /// Sum of points across resident chunks.
+    public var residentPoints: Int
+    /// Resident chunks at depth ≤ `coarsePinnedDepth` (guaranteed-coverage set).
+    public var pinnedResidentChunks: Int
+    /// Decoded-but-not-yet-uploaded chunks in the GPU upload backlog.
+    public var pendingUploadCount: Int
+    /// Source decode-pipeline nodes mid-decompress.
+    public var decodeInFlight: Int
+    /// Source decode-pipeline nodes scheduled but not yet decoding.
+    public var decodePendingRequests: Int
+    /// Estimated decode throughput in points/second (EMA).
+    public var decodedPointsPerSecond: Double
+    /// Chunks uploaded to the GPU pool over the adapter's lifetime.
+    public var totalChunksUploaded: Int
+    /// Chunks evicted (slots freed) over the adapter's lifetime.
+    public var totalChunksEvicted: Int
+    /// Decoded chunks dropped from the pending queue by pre-upload eviction.
+    public var totalPendingDroppedByEviction: Int
+    /// Ticks on which a pending chunk could not upload (slot pool full).
+    public var starvedTickCount: Int
+    /// Last non-fatal notice (e.g. "slot pool full"), if any.
+    public var lastError: String?
+
+    public init(
+        state: StreamingResidencyState,
+        poolCapacity: Int,
+        freeSlots: Int,
+        residentChunks: Int,
+        residentPoints: Int,
+        pinnedResidentChunks: Int,
+        pendingUploadCount: Int,
+        decodeInFlight: Int,
+        decodePendingRequests: Int,
+        decodedPointsPerSecond: Double,
+        totalChunksUploaded: Int,
+        totalChunksEvicted: Int,
+        totalPendingDroppedByEviction: Int,
+        starvedTickCount: Int,
+        lastError: String?
+    ) {
+        self.state = state
+        self.poolCapacity = poolCapacity
+        self.freeSlots = freeSlots
+        self.residentChunks = residentChunks
+        self.residentPoints = residentPoints
+        self.pinnedResidentChunks = pinnedResidentChunks
+        self.pendingUploadCount = pendingUploadCount
+        self.decodeInFlight = decodeInFlight
+        self.decodePendingRequests = decodePendingRequests
+        self.decodedPointsPerSecond = decodedPointsPerSecond
+        self.totalChunksUploaded = totalChunksUploaded
+        self.totalChunksEvicted = totalChunksEvicted
+        self.totalPendingDroppedByEviction = totalPendingDroppedByEviction
+        self.starvedTickCount = starvedTickCount
+        self.lastError = lastError
+    }
+}
+
 /// Bridges a SwiftPDAL `StreamingPointCloudSource` to a
 /// `PointRasteriserPointCloud` slot pool.
 ///
@@ -187,9 +291,75 @@ public final class StreamingAdapter {
     /// overflow is permanently un-placeable. Treat it like the budget clamp:
     /// caught up once everything *placeable* is uploaded
     /// (``uploadBlockedOnFullPool``), rather than stalling forever.
+    ///
+    /// Reimplemented in terms of ``residencyState`` — provably identical to the
+    /// original `source.isResidencySettled && (pendingUploadCount == 0 ||
+    /// uploadBlockedOnFullPool)`, since ``residencyState`` returns a `.settled`
+    /// case under **exactly** that condition and `.streaming` otherwise.
     public var isCaughtUp: Bool {
-        guard source.isResidencySettled else { return false }
-        return pendingUploadCount == 0 || uploadBlockedOnFullPool
+        if case .settled = residencyState { return true }
+        return false
+    }
+
+    /// Typed settle state for the submitted residency target — the structured
+    /// counterpart to ``isCaughtUp`` and its two clamp flags. Derived **only**
+    /// from existing members, so `isCaughtUp == (residencyState is .settled)`
+    /// holds for every input combination. Read after ``pump()``.
+    ///
+    /// The mapping:
+    /// * source not settled, **or** an upload backlog remains that is *not*
+    ///   pool-blocked → ``StreamingResidencyState/streaming``;
+    /// * settled with no clamping →
+    ///   ``StreamingResidencyState/settled(_:)`` of ``StreamingResidencyCoverage/full``;
+    /// * settled but clamped by budget and/or a full pool →
+    ///   `.settled(.clamped(byBudget:byPool:))` carrying
+    ///   ``residencyBudgetLimited`` and ``uploadBlockedOnFullPool`` respectively.
+    ///
+    /// **Pool-clamp scenario (`.settled(.clamped(byPool: true))`):** the driver
+    /// clamps its wanted set by *bytes* (charging each node its actual point
+    /// count) while the slot pool allocates *whole batches*, so a settled,
+    /// in-budget wanted set can need more slots than the pool has — every small
+    /// or partial node still consumes a full slot. Once the source is settled no
+    /// eviction will free a slot, so the overflow is permanently un-placeable and
+    /// ``pump()`` leaves ``uploadBlockedOnFullPool`` set. This case is the typed
+    /// signal for that condition, which was previously visible only as a
+    /// ``pendingUploadCount`` stuck above zero with no further progress.
+    public var residencyState: StreamingResidencyState {
+        guard source.isResidencySettled,
+              pendingUploadCount == 0 || uploadBlockedOnFullPool
+        else { return .streaming }
+
+        if residencyBudgetLimited || uploadBlockedOnFullPool {
+            return .settled(.clamped(
+                byBudget: residencyBudgetLimited,
+                byPool: uploadBlockedOnFullPool
+            ))
+        }
+        return .settled(.full)
+    }
+
+    /// A single `Sendable` snapshot of the current residency + decode telemetry,
+    /// replacing ad-hoc string-formatting of the individual properties. Same
+    /// threading rule as those properties: read on the thread that calls
+    /// ``pump()`` (see the "Telemetry (read on the main thread)" MARK).
+    public var telemetry: StreamingResidencyTelemetry {
+        StreamingResidencyTelemetry(
+            state: residencyState,
+            poolCapacity: cloud.batchCount,
+            freeSlots: cloud.freeSlotCount,
+            residentChunks: residentChunks,
+            residentPoints: residentPoints,
+            pinnedResidentChunks: pinnedResidentChunks,
+            pendingUploadCount: pendingUploadCount,
+            decodeInFlight: decodeInFlight,
+            decodePendingRequests: decodePendingRequests,
+            decodedPointsPerSecond: decodedPointsPerSecond,
+            totalChunksUploaded: totalChunksUploaded,
+            totalChunksEvicted: totalChunksEvicted,
+            totalPendingDroppedByEviction: totalPendingDroppedByEviction,
+            starvedTickCount: starvedTickCount,
+            lastError: lastError
+        )
     }
 
     /// Whether the driver's wanted set was clamped by the byte budget with
