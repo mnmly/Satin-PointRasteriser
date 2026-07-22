@@ -134,16 +134,68 @@ public final class StreamingAdapter {
     /// Per-frame tick. Submits the latest camera view and applies the driver's
     /// delta, uploading decoded chunks into the slot pool.
     public func update(camera: Camera, viewport: SIMD2<Float>) {
-        let scale = PointRasteriserStreamingProjection.screenSpacePixelScale(
-            viewportHeight: viewport.y,
-            projectionMatrix: camera.projectionMatrix
-        )
-        source.submit(view: StreamingCameraView(
+        submit(camera: camera, viewport: viewport)
+        pump()
+    }
+
+    /// Build a ``SwiftPDAL/StreamingCameraView`` from a renderer camera + drawable
+    /// size and submit it as the residency target (single-view). Split out of
+    /// ``update(camera:viewport:)`` so a caller can drive the target and the
+    /// upload pump independently (e.g. an offline "pump until resident" loop).
+    public func submit(camera: Camera, viewport: SIMD2<Float>) {
+        source.submit(view: cameraView(camera, viewport: viewport))
+    }
+
+    /// Submit the **union** of several camera views as the residency target —
+    /// for a multi-projection frame (CAVE walls + floor, stereo eyes) or camera-
+    /// path look-ahead. A node is wanted if any view sees it, at the detail the
+    /// best-placed view needs. Size the budget to hold the union;
+    /// ``residencyBudgetLimited`` reports when it doesn't. See
+    /// ``SwiftPDAL/StreamingPointCloudSource/submit(views:)``.
+    public func submit(cameras: [(camera: Camera, viewport: SIMD2<Float>)]) {
+        source.submit(views: cameras.map { cameraView($0.camera, viewport: $0.viewport) })
+    }
+
+    private func cameraView(_ camera: Camera, viewport: SIMD2<Float>) -> StreamingCameraView {
+        StreamingCameraView(
             position: camera.worldPosition,
             viewProjection: camera.projectionMatrix * camera.viewMatrix,
-            pixelScale: scale
-        ))
+            pixelScale: PointRasteriserStreamingProjection.screenSpacePixelScale(
+                viewportHeight: viewport.y,
+                projectionMatrix: camera.projectionMatrix
+            )
+        )
+    }
 
+    /// `true` once the frame is fully streamed in: every wanted chunk (for the
+    /// submitted view/views at the current budget) is resident on the driver
+    /// **and** uploaded into this adapter's slot pool. Read after ``pump()`` to
+    /// drive a pre-roll loop. Independent of ``residencyBudgetLimited`` — a
+    /// budget-clamped frame still becomes "caught up" once the clamped set is in.
+    public var isCaughtUp: Bool {
+        pendingUploadCount == 0 && source.isResidencySettled
+    }
+
+    /// Whether the driver's wanted set was clamped by the byte budget with
+    /// frustum-visible candidates left out. Read alongside ``isCaughtUp`` to
+    /// decide whether to raise ``setBudget(bytes:)`` for full coverage. See
+    /// ``SwiftPDAL/StreamingPointCloudSource/residencyBudgetLimited``.
+    public var residencyBudgetLimited: Bool { source.residencyBudgetLimited }
+
+    /// GPU payload bytes for the whole file (`totalPoints × bytesPerPoint`) — the
+    /// natural ceiling for a budget auto-raise: at this budget every node is
+    /// wanted (whole-file mode), so ``residencyBudgetLimited`` can no longer be
+    /// true. A pre-roll raising the budget to cover a multi-view union never
+    /// needs to exceed it.
+    public var totalPayloadBytes: Int {
+        Int(source.info.totalPoints) * source.info.bytesPerPoint
+    }
+
+    /// Poll the driver's residency delta and upload decoded chunks into the slot
+    /// pool. This is ``update(camera:viewport:)`` minus the camera submit, so a
+    /// pre-roll can `submit(...)` once and then `pump()` repeatedly (yielding to
+    /// let decode workers run) until ``isCaughtUp``.
+    public func pump() {
         // Decode telemetry from the source's authoritative, thread-safe stats.
         // decodedPoints is monotonic → rate = Δpoints / Δt (EMA-smoothed).
         let stats = source.decodeStats()

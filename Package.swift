@@ -17,7 +17,9 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/Fabric-Project/Satin", exact: "20.0.0-Beta-1"),
-        .package(url: "https://github.com/mnmly/SwiftPDAL", from: "1.23.0"),
+        // Streaming adapter's residency pre-roll (submit(views:)/isResidencySettled/
+        // residencyBudgetLimited) needs SwiftPDAL 1.26.0+.
+        .package(url: "https://github.com/mnmly/SwiftPDAL", from: "1.26.0"),
     ],
     targets: [
         .target(
