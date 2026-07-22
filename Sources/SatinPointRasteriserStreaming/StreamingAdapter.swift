@@ -109,6 +109,12 @@ public final class StreamingAdapter {
     /// Ticks on which a pending chunk could not upload because the slot pool was
     /// full (no eviction to free a slot).
     public private(set) var starvedTickCount: Int = 0
+    /// `true` while the upload backlog is blocked on a full slot pool (the last
+    /// ``pump()`` broke on "no free slot" rather than draining or hitting the
+    /// per-tick cap). With the source settled this state is permanent — nothing
+    /// will be evicted to free a slot — so ``isCaughtUp`` treats the placeable
+    /// set as complete instead of waiting forever. See ``isCaughtUp``.
+    public private(set) var uploadBlockedOnFullPool: Bool = false
     /// Estimated decode throughput in points/second (EMA of the source's
     /// monotonic ``SwiftPDAL/StreamingDecodeStats/decodedPoints``).
     public private(set) var decodedPointsPerSecond: Double = 0
@@ -172,8 +178,18 @@ public final class StreamingAdapter {
     /// **and** uploaded into this adapter's slot pool. Read after ``pump()`` to
     /// drive a pre-roll loop. Independent of ``residencyBudgetLimited`` — a
     /// budget-clamped frame still becomes "caught up" once the clamped set is in.
+    ///
+    /// **Slot-granularity overflow:** the driver clamps its wanted set by *bytes*
+    /// (charging each node its actual point count) while the slot pool is sized
+    /// in whole batches, so a settled in-budget wanted set can need more GPU
+    /// slots than the pool has — every small/partial node occupies a full slot.
+    /// Once the source is settled no eviction will ever free a slot, so that
+    /// overflow is permanently un-placeable. Treat it like the budget clamp:
+    /// caught up once everything *placeable* is uploaded
+    /// (``uploadBlockedOnFullPool``), rather than stalling forever.
     public var isCaughtUp: Bool {
-        pendingUploadCount == 0 && source.isResidencySettled
+        guard source.isResidencySettled else { return false }
+        return pendingUploadCount == 0 || uploadBlockedOnFullPool
     }
 
     /// Whether the driver's wanted set was clamped by the byte budget with
@@ -289,6 +305,7 @@ public final class StreamingAdapter {
             uploaded += 1
         }
         if starvedThisTick { starvedTickCount += 1 }
+        uploadBlockedOnFullPool = starvedThisTick
 
         if pendingCursor == pendingAdds.count {
             pendingAdds.removeAll(keepingCapacity: true)
